@@ -1,0 +1,40 @@
+&lt;?xml version="1.0" encoding="UTF-8"?&gt;
+<Sysmon schemaversion="4.90">
+  <!--
+    NetLedger Sysmon Configuration
+    Purpose: Monitor network connections, process creation, and file creation events
+    for the Windows Network Traffic Monitoring & Log Collection System.
+
+    Event IDs captured:
+      - Event ID 1: Process Creation (process path, command line, parent process, user)
+      - Event ID 3: Network Connection (process path, destination IP, port, protocol, direction)
+      - Event ID 11: File Creation (process path, created file path)
+
+    Default process images: only those involved in network activity, plus system processes.
+  -->
+
+  <EventFiltering>
+    <!-- ===== Process Creation (Event ID 1) ===== -->
+    <ProcessCreate onmatch="exclude">
+      <!-- Exclude noisy system processes to keep logs focused on user/network activity -->
+    </ProcessCreate>
+
+    <!-- ===== Network Connection (Event ID 3) ===== -->
+    <NetworkConnect onmatch="include">
+      <!-- Monitor ALL outbound network connections by default -->
+    </NetworkConnect>
+
+    <!-- ===== File Creation (Event ID 11) ===== -->
+    <FileCreateTime onmatch="include">
+      <!-- Monitor file creation in common download and temp directories -->
+      <TargetFilename condition="contains">Downloads</TargetFilename>
+      <TargetFilename condition="contains">Temp</TargetFilename>
+      <TargetFilename condition="contains">AppData\Local\Temp</TargetFilename>
+      <TargetFilename condition="contains">Desktop</TargetFilename>
+    </FileCreateTime>
+  </EventFiltering>
+
+  <!-- Hash algorithm configuration -->
+  <HashAlgorithms>SHA256</HashAlgorithms>
+
+</Sysmon>

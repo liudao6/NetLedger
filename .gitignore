@@ -1,0 +1,21 @@
+# NetLedger - Git Ignore
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# PowerShell output
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+.codebuddy
+
+# System
+*.tmp
+*.temp
+
+# Depoyment runtime files (not tracked in repo)
+NetworkMonitor/
