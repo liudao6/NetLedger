@@ -42,6 +42,44 @@
 ### Q: 可以导出 CSV 格式吗？
 **A**: 当前版本仅支持 TXT 格式。`$ExportFormat` 配置项预留了 CSV 选项，后续版本会支持。
 
+### Q: 日志里有两个 "TOP 10 进程" 表，有什么区别？
+**A**: 从 v1.1 起，日报有两张表：
+- **流量 TOP 10 进程 Top 10 Processes by Traffic (Bytes)** — 真正的"哪个应用在吃流量"。字段是「上传 Sent / 下载 Recv / 总流量 Total / 占比%」，数据来自 ETW Kernel-Network 会话记录的每个 TCP/UDP Send/Recv 的字节数。
+- **连接 TOP 10 进程 Top 10 Processes by Connection Count** — 哪个进程"连接次数多"。字段是「连接数 / 出站 / 入站 / 涉及IP数」，数据来自 Security 5156 + Sysmon 3。
+
+两者经常不一致：`chrome.exe` 可能连接数最多但流量不大（小请求多），`steam.exe` 可能连接数少但流量最大（在下游戏）。回答"哪个应用在吃流量"请看第一张表。
+
+---
+
+## 流量采集（ETW）
+
+### Q: Status 显示 "ETW会话状态：未注册 Not registered"，怎么办？
+**A**: 这通常意味着 Init 还没运行过、或被人手动 `logman delete` 删除了。重新以管理员运行 `.\NetworkMonitor.ps1 -Mode Init`，会重新创建并启动 ETW 会话。Init 是幂等的，重复运行只会重置配置不会破坏其他东西。
+
+### Q: Status 显示 "ETW会话状态：已注册但未运行 Registered but stopped"，怎么办？
+**A**: 通常出现在系统刚启动后 30 秒内（开机自启任务还没执行）或者有人手动 `logman stop` 了。可以：
+- 等几秒让开机任务自动执行
+- 手动执行：`logman start NetLedgerTraffic`（管理员）
+- 直接运行 Export：`.\NetworkMonitor.ps1 -Mode Export` — 脚本开头会自动 `Ensure-TrafficSession` 把会话重新拉起来
+
+### Q: 日志里"流量 TOP 10"表是空的，但连接 TOP 10 有数据，为什么？
+**A**: 三种可能：
+1. **会话刚启动还没积累数据**：第一次 Export 后，下次 Export 才能看到完整一天的字节数。请等下一个采集周期再看。
+2. **Init 后没有重启过 Export**：会话在 Init 时启动，但 Export 还没运行过，ETL 文件还是空。运行 `.\NetworkMonitor.ps1 -Mode Export` 即可。
+3. **会话被某个安全软件拦截**：部分 EDR（如 CrowdStrike、Defender for Endpoint）会接管 kernel trace，导致 `logman start` 看似成功但实际不写事件。检查 `run.log` 里 Export 步骤是否报告"ETL was empty"。
+
+### Q: 报表里"上传 Sent"和"下载 Recv"具体指什么？
+**A**: 来自 `Microsoft-Windows-Kernel-Network` provider：
+- **上传 Sent** (Event ID 3)：本机进程主动发起的 TCP/UDP `send` 调用，包含发送的字节数。
+- **下载 Recv** (Event ID 4)：本机进程收到的 TCP/UDP `recv` 数据。
+注意：方向是按"本机进程视角"标记的，与防火墙的"入站/出站"含义一致但来源不同。NAT 后的流量、UDP 无连接流量也都会被记录。
+
+### Q: ETW 会话会占用很多资源吗？
+**A**: 普通办公电脑约 100-1000 事件/秒，CPU 占用 <1%，磁盘固定上限 256 MB（循环覆盖）。如果担心，可以编辑脚本顶部的 `$TrafficEtlMaxMB` 改小到 64 或 128，再重新 Init。
+
+### Q: 卸载会停掉 ETW 会话吗？
+**A**: 会的。`Uninstall-NetworkMonitor.ps1` 第 [5/6] 步会 `logman stop` 并 `logman delete` 移除 ETW 会话，第 [6/6] 步会删除开机自启任务，不会残留。
+
 ---
 
 ## 告警相关

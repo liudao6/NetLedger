@@ -139,3 +139,41 @@
 - Bilingual format serves the project's dual audience
 
 **Trade-off**: Report files are slightly larger due to dual labels. Accepted as necessary for the use case.
+
+---
+
+## DD-011: ETW Kernel-Network Session for Per-Process Byte Attribution
+
+**Decision**: Add a persistent real-time ETW trace session (`logman create trace NetLedgerTraffic`) that enables both `Microsoft-Windows-Kernel-Network` (Send/Recv events with `size` field) and `Microsoft-Windows-Kernel-Process` (ImageLoad/ProcessStart for PID→ProcessName resolution), so the daily report can answer "which process is consuming bandwidth" by actual byte counts rather than connection counts.
+
+**Rationale**:
+- The original 6 data sources (Security 5156/4688, DNS 3008, Sysmon 1/3/11) only record **connection establishment**, not bytes transferred. The "流量 TOP 10 进程" table in v1.0 was actually a "连接次数 TOP 10" — a `chrome.exe` with 3000 connections might transfer only 5 MB while `steam.exe` with 50 connections could move 30 GB. Connection count and bandwidth are uncorrelated.
+- `Microsoft-Windows-Kernel-Network` is the kernel provider that fires on **every** TCP/UDP Send/Recv with the byte `size` plus the owning PID in the event header — the only native Windows mechanism that gives true per-process byte attribution without third-party drivers.
+- A companion `Microsoft-Windows-Kernel-Process` provider is enabled so ProcessStart/ImageLoad events carry `ProcessID + ImageFileName`, letting the parser resolve PID→name for processes that **started before the trace session began** (the failure mode of `Get-Process -Id` after the process has exited).
+
+**Architecture choices**:
+- **Persistent registry session (no `-ets`)**: `logman create trace` without `-ets` stores the session in `HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger`. This survives reboots, but the session still needs an explicit `logman start` after each boot — handled by a standalone scheduled task `NetLedger_TrafficSessionAtBoot` triggered at startup with a 30-second delay, plus an idempotent `Ensure-TrafficSession` guard at the head of every `Export` run (defense in depth).
+- **Circular ETL (`-ctw`, max 256 MB)**: bounds disk usage so the trace can run 24/7. Old events are overwritten by new ones once the cap is hit — accepted because Export archives the ETL daily.
+- **Stop-archive-restart workflow**: at each Export, the live session is stopped, `traffic.etl` is moved to a timestamped archive, then the session is restarted. ~1 second of network events are lost during the restart; accepted as a trade-off vs. the alternative of running a second shadow session (more complex, double resource usage).
+
+**Trade-offs**:
+- **Constant overhead**: a kernel ETW session at this verbosity generates roughly 100-1000 events/sec under typical usage. CPU impact is <1% on modern hardware; disk I/O is bounded by the 256 MB circular file.
+- **PID reuse edge case**: a PID can be reused by a different process between the trace start and the Send/Recv event. Mitigated by always taking the **latest** ImageLoad event for a given PID — imperfect but rarely wrong in practice.
+- **Session requires Admin to create** (matches existing Init requirement; no new privilege escalation).
+- **`Get-WinEvent -Path` ETL parsing**: capped to 1,000,000 events per parse to bound memory. On very-high-traffic hosts (>1 GB/day) some Send/Recv events will be silently dropped from the daily report. Mitigated by warning in `run.log` when the cap is hit (future work).
+
+**Rejected alternatives**:
+- **Performance counters `\Process(*)\IO Data Bytes/sec`**: includes disk I/O, overestimates network traffic 2-5×. Wrong data is worse than no data here.
+- **`pktmon` continuous capture**: precise per-packet bytes but per-PID aggregation requires manual PID filter setup and is awkward for 24/7 collection. Better suited for ad-hoc diagnosis.
+- **Sysmon-only**: Sysmon Event 3 (NetworkConnect) fires only on connection establishment; the schema has no `sentBytes`/`receivedBytes` field. Configuration changes cannot fix this — it is a provider-level limitation.
+- **Third-party driver (NetLimiter/GlassWire)**: violates the "zero external dependencies" project principle (DD-009).
+
+---
+
+## DD-012: Rename "流量 TOP 10" → "连接 TOP 10"
+
+**Decision**: The pre-existing report section formerly titled "流量 TOP 10 进程" (whose actual fields were `连接数/出站/入站/涉及IP数`) is renamed to "连接 TOP 10 进程 Top 10 Processes by Connection Count", and a new "流量 TOP 10 进程 Top 10 Processes by Traffic (Bytes)" section using ETW Send/Recv byte aggregation is inserted above it.
+
+**Rationale**:
+- The v1.0 section title was misleading: it counted connections, not bytes. Keeping the old title with byte data underneath would be equally misleading.
+- Both tables are kept (rather than removing the connection-count table) because the two views answer different questions — connection count tells you which process is "chatty" (lots of short connections, e.g. telemetry), while byte count tells you which process is "heavy" (large transfers, e.g. downloads). The report now answers both.

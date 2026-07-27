@@ -57,7 +57,13 @@ $SysmonDir     = "C:\Sysmon"                # Sysmon 安装目录
 $DailyRunTime  = "00:30"                    # 每天归集时间（24小时制）
 $RetentionDays = 90                         # 日志保留天数（超过自动删除）
 $ExportFormat  = "txt"                      # 导出格式：txt 或 csv
+
+# --- 每进程流量采集（ETW Kernel-Network 会话）---
+$TrafficSessionName = "NetLedgerTraffic"   # logman 会话名（主机内唯一）
+$TrafficEtlMaxMB    = 256                   # ETL 最大大小（循环覆盖）
 ```
+
+修改 ETW 相关变量后，需要重新运行 `Init` 让会话按新配置重建。修改其他变量（如 `$DailyRunTime`、`$RetentionDays`）则只需重新运行 `Init` 来刷新任务计划/保留策略，下次 Export 即生效。
 
 修改后无需重新初始化，下次 Export 执行时生效。
 
@@ -69,12 +75,21 @@ $ExportFormat  = "txt"                      # 导出格式：txt 或 csv
 
 | 部分 | 内容 |
 |------|------|
-| 统计汇总 | 连接总数、进出站数量、独立IP/域名数、TOP10进程/域名/文件创建 |
+| 统计汇总 | 连接总数、进出站数量、独立IP/域名数、**流量 TOP10 进程（按字节）**、连接 TOP10 进程（按连接数）、TOP10域名/文件创建 |
 | 异常告警 | 非常用端口、凌晨异常活动、DNS失败、可疑进程、大文件下载 |
 | 连接明细 | 所有网络连接的进程、目标IP、端口、方向 |
 | DNS查询记录 | 所有域名查询及解析结果 |
 | 文件创建记录 | 在 Downloads/Temp/Desktop 创建的文件 |
 | 进程启动记录 | 所有新启动的进程及命令行参数 |
+
+### "流量 TOP 10" vs "连接 TOP 10" 的区别（重要）
+
+从 v1.1 起，统计汇总部分有两张看起来相似但含义不同的表：
+
+- **流量 TOP 10 进程 Top 10 Processes by Traffic (Bytes)** —— 字段：上传 Sent / 下载 Recv / 总流量 Total / 占比%。**这才是"哪个应用在吃流量"的答案**。数据来自 ETW Kernel-Network 会话记录的每次 TCP/UDP Send/Recv 的真实字节数。
+- **连接 TOP 10 进程 Top 10 Processes by Connection Count** —— 字段：连接数 / 出站 / 入站 / 涉及IP数。回答"哪个应用连接次数多"，不是"流量大"。
+
+举个常见反差：`chrome.exe` 通常连接数最多（短请求密集），但 `steam.exe / 微信 / BT 客户端` 才是吃流量的。**判断带宽占用请看第一张表。**
 
 ---
 

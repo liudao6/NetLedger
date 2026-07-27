@@ -38,6 +38,7 @@
 | `Get-Sysmon1` | Sysmon/1 | 10,000 | Returns @() if Sysmon unavailable |
 | `Get-Sysmon3` | Sysmon/3 | 50,000 | Returns @() if Sysmon unavailable |
 | `Get-Sysmon11` | Sysmon/11 | 10,000 | Returns @() if Sysmon unavailable |
+| `Get-TrafficBytes` | ETL (Kernel-Network 3/4 + Kernel-Process 1/5) | 1,000,000 | Returns @() if ETW session not registered / no ETL found |
 
 ### Statistics Functions
 
@@ -45,9 +46,20 @@
 |----------|-------|--------|
 | `Get-ConnectionStats` | Security5156[], Sysmon3[] | `@{TotalConn, Outbound, Inbound, UniqueIPs}` |
 | `Get-Top10ProcessByConnection` | Security5156[], Sysmon3[] | `[PSCustomObject[]]` with Rank/ProcessName/TotalConn/Outbound/Inbound/UniqueIPs |
+| `Get-Top10ProcessByTraffic` | TrafficEvents[] (Send/Recv with bytes) | `[PSCustomObject[]]` with Rank/ProcessName/SentBytes/RecvBytes/TotalBytes/EventCount/Percent |
 | `Get-Top10Domain` | DNS3008[] | `[PSCustomObject[]]` with Rank/Domain/QueryCount |
 | `Get-Top10FileCreate` | Sysmon11[] | `[PSCustomObject[]]` with Rank/ProcessName/FileCount |
 | `Get-NewDomains` | DNS3008[], YesterdayLogFile path | `[PSCustomObject[]]` with Domain/FirstSeen |
+
+### ETW Traffic Session Functions
+
+| Function | Mode | Purpose |
+|----------|------|---------|
+| `Initialize-TrafficSession` | Init | Create + start the `NetLedgerTraffic` logman trace session with Kernel-Network + Kernel-Process providers |
+| `Ensure-TrafficSession` | Export (head) | Idempotent restart if session died between boot and Export |
+| `Test-TrafficSessionExists` | Status / Export | True if session is registered in the registry |
+| `Test-TrafficSessionRunning` | Status / Export | True if session is currently running (query output matches `Running\|运行`) |
+| `Format-BytesForReport` | Report | Human-readable byte formatting: `1023 B / 1.45 KB / 2.30 MB / 5.10 GB` |
 
 ### Anomaly Detectors
 

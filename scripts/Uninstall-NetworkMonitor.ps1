@@ -34,6 +34,10 @@ $LogRootDir    = "D:\NetworkMonitor"
 $TaskName      = "NetworkMonitor_DailyExport"
 $SysmonService = "Sysmon64"
 $SysmonExe     = "C:\Windows\Sysmon64.exe"
+# ETW traffic capture session (per-process byte attribution)
+$TrafficSessionName = "NetLedgerTraffic"
+$TrafficTaskName    = "NetLedger_TrafficSessionAtBoot"
+$TrafficEtlDir       = Join-Path $LogRootDir "traffic"
 # ======================================================================
 
 $script:UninstallLog = Join-Path $LogRootDir "scripts\uninstall.log"
@@ -72,7 +76,7 @@ if (-not (Test-Admin)) {
 $allSuccess = $true
 
 # 1. Remove Scheduled Task
-Write-Host "[1/5] Removing Scheduled Task '$TaskName'..." -ForegroundColor Yellow
+Write-Host "[1/6] Removing Scheduled Task '$TaskName'..." -ForegroundColor Yellow
 try {
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($task) {
@@ -87,7 +91,7 @@ try {
 }
 
 # 2. Disable Audit Policies
-Write-Host "[2/5] Disabling Windows Audit Policies..." -ForegroundColor Yellow
+Write-Host "[2/6] Disabling Windows Audit Policies..." -ForegroundColor Yellow
 try {
     $auditPolicies = @(
         @{Subcategory = "Filtering Platform Connection"; Guid = "{0CCE922B-69AE-11D9-BED3-505054503030}"},
@@ -113,7 +117,7 @@ try {
 }
 
 # 3. Disable DNS Client Operational Log
-Write-Host "[3/5] Disabling DNS Client Operational Log..." -ForegroundColor Yellow
+Write-Host "[3/6] Disabling DNS Client Operational Log..." -ForegroundColor Yellow
 try {
     $dnsLog = Get-WinEvent -ListLog "Microsoft-Windows-DNS-Client/Operational" -ErrorAction SilentlyContinue
     if ($dnsLog -and $dnsLog.IsEnabled) {
@@ -128,7 +132,7 @@ try {
 }
 
 # 4. Uninstall Sysmon
-Write-Host "[4/5] Uninstalling Sysmon..." -ForegroundColor Yellow
+Write-Host "[4/6] Uninstalling Sysmon..." -ForegroundColor Yellow
 try {
     $sysmonService = Get-Service -Name $SysmonService -ErrorAction SilentlyContinue
     if ($sysmonService) {
@@ -159,9 +163,40 @@ try {
     $allSuccess = $false
 }
 
+# 5. Stop and delete the ETW traffic trace session
+Write-Host "[5/6] Stopping and removing ETW traffic session '$TrafficSessionName'..." -ForegroundColor Yellow
+try {
+    # Stop the session first (if running) so the ETL file is properly flushed
+    & logman stop $TrafficSessionName 2>&1 | Out-Null
+    Start-Sleep -Milliseconds 500
+    # Delete the session definition (registered in the registry by Init)
+    $delOut = & logman delete $TrafficSessionName 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "       ETW traffic session removed." -ForegroundColor Green
+    } else {
+        Write-Host "       Traffic session already absent or delete returned: $delOut" -ForegroundColor Gray
+    }
+} catch {
+    Write-Host "       WARNING: Failed to remove traffic session: $_" -ForegroundColor DarkYellow
+}
+
+# 6. Remove the standalone traffic boot task
+Write-Host "[6/6] Removing traffic boot task '$TrafficTaskName'..." -ForegroundColor Yellow
+try {
+    $trafficTask = Get-ScheduledTask -TaskName $TrafficTaskName -ErrorAction SilentlyContinue
+    if ($trafficTask) {
+        Unregister-ScheduledTask -TaskName $TrafficTaskName -Confirm:$false -ErrorAction Stop
+        Write-Host "       Traffic boot task removed." -ForegroundColor Green
+    } else {
+        Write-Host "       Traffic boot task not found (already removed)." -ForegroundColor Gray
+    }
+} catch {
+    Write-Host "       WARNING: Failed to remove traffic boot task: $_" -ForegroundColor DarkYellow
+}
+
 # 5. Optionally remove directories
 if ($RemoveLogs) {
-    Write-Host "[5/5] Removing log directory '$LogRootDir'..." -ForegroundColor Yellow
+    Write-Host "[Extra] Removing log directory '$LogRootDir'..." -ForegroundColor Yellow
     try {
         if (Test-Path $LogRootDir) {
             Remove-Item -Path $LogRootDir -Recurse -Force -ErrorAction Stop

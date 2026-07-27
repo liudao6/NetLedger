@@ -69,6 +69,16 @@ $SysmonDir     = "C:\Sysmon"                # Sysmon installation directory
 $DailyRunTime  = "00:30"                    # Daily collection time (24h format)
 $RetentionDays = 90                         # Log retention days (auto-delete older)
 $ExportFormat  = "txt"                      # Export format: txt or csv
+
+# --- Per-Process Traffic Capture (ETW Kernel-Network session) ---
+# A persistent ETW real-time session logs every TCP/UDP Send/Recv with byte
+# counts + PID, so the daily report can answer "which process is eating bandwidth".
+$TrafficSessionName = "NetLedgerTraffic"                 # logman trace session name (must be unique on the host)
+$TrafficEtlMaxMB    = 256                                # ETL file max size (circular overwrite)
+$TrafficNetworkKW   = [uint64]"0xFFFFFFFF"               # Kernel-Network keywords: all events
+$TrafficNetworkLV   = 4                                 # Kernel-Network level: informational (>=4)
+$TrafficProcessKW   = [uint64]"0x40"                     # Kernel-Process keywords: ProcessStart/Stop (ImageID)
+$TrafficProcessLV   = 4                                 # Kernel-Process level: informational
 # ==================================================================
 
 # Script paths
@@ -77,8 +87,10 @@ $ScriptDir      = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent
 $LogsDir        = Join-Path $LogRootDir "logs"
 $ScriptsDir     = Join-Path $LogRootDir "scripts"
 $SysmonLogDir   = Join-Path $LogRootDir "sysmon"
+$TrafficEtlDir  = Join-Path $LogRootDir "traffic"        # ETW live + archived ETL files
 $RunLogFile     = Join-Path $ScriptsDir "run.log"
 $TaskName       = "NetworkMonitor_DailyExport"
+$TrafficTaskName = "NetLedger_TrafficSessionAtBoot"      # standalone boot task: logman start
 $SysmonExe      = Join-Path $SysmonDir "Sysmon64.exe"
 $SysmonConfig   = Join-Path $SysmonDir "sysmon-config.xml"
 $ReadmeFile     = Join-Path $LogRootDir "README.txt"
@@ -171,6 +183,15 @@ function Format-FixedWidth {
         if ($i -lt $Columns.Count - 1) { $result += $Separator }
     }
     return $result
+}
+
+function Format-BytesForReport {
+    # Human-readable byte count: 1023 B / 1.45 KB / 2.30 MB / 5.10 GB
+    param([long]$Bytes)
+    if ($Bytes -ge 1GB) { return "$([math]::Round($Bytes / 1GB, 2)) GB" }
+    if ($Bytes -ge 1MB) { return "$([math]::Round($Bytes / 1MB, 2)) MB" }
+    if ($Bytes -ge 1KB) { return "$([math]::Round($Bytes / 1KB, 2)) KB" }
+    return "$Bytes B"
 }
 
 function Get-DateRange {
@@ -554,7 +575,7 @@ function Initialize-DirectoryStructure {
     Write-Host "--- Creating Directory Structure ---" -ForegroundColor Cyan
     Write-RunLog "Creating directory structure..."
 
-    $dirs = @($LogRootDir, $LogsDir, $ScriptsDir, $SysmonLogDir)
+    $dirs = @($LogRootDir, $LogsDir, $ScriptsDir, $SysmonLogDir, $TrafficEtlDir)
     foreach ($dir in $dirs) {
         if (-not (Test-Path $dir)) {
             try {
@@ -638,6 +659,47 @@ function Initialize-TaskScheduler {
         Write-RunLog "Failed to register scheduled task: $_" -Level "ERROR"
         Write-Host "  [ERROR] Failed to register task: $_" -ForegroundColor Red
     }
+
+    # --- Standalone boot task: ensure the ETW traffic session is running ASAP
+    # after every reboot. This task only runs `logman start` and is independent
+    # of the daily Export task so traffic capture resumes within ~30s of boot
+    # rather than waiting until the next 00:30 run.
+    try {
+        $trafficAction = New-ScheduledTaskAction `
+            -Execute "logman.exe" `
+            -Argument "start $TrafficSessionName"
+
+        # Boot trigger with a short delay (kernel networking + logman service must be up first)
+        $trafficTrigger = New-ScheduledTaskTrigger -AtStartup -RandomDelay (New-TimeSpan -Seconds 30)
+
+        $trafficSettings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -RestartCount:3 `
+            -RestartInterval:(New-TimeSpan -Minutes 5) `
+            -ExecutionTimeLimit:(New-TimeSpan -Minutes 2) `
+            -MultipleInstances "IgnoreNew"
+
+        $trafficPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+        # Remove existing task if present
+        Unregister-ScheduledTask -TaskName $TrafficTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        Register-ScheduledTask `
+            -TaskName $TrafficTaskName `
+            -Action $trafficAction `
+            -Trigger $trafficTrigger `
+            -Settings $trafficSettings `
+            -Principal $trafficPrincipal `
+            -Description "NetLedger - restart the ETW traffic trace session at every boot" `
+            -ErrorAction Stop | Out-Null
+
+        Write-RunLog "Boot task for traffic session registered: $TrafficTaskName"
+        Write-Host "  [OK] Boot task registered for ETW session: $TrafficTaskName" -ForegroundColor Green
+    } catch {
+        Write-RunLog "Failed to register traffic boot task: $_" -Level "WARN"
+        Write-Host "  [WARN] Failed to register traffic boot task: $_" -ForegroundColor Yellow
+    }
 }
 
 function Initialize-Readme {
@@ -691,6 +753,143 @@ For detailed documentation, see the project docs/ directory.
         Write-Host "  [OK] README.txt created" -ForegroundColor Green
     } catch {
         Write-RunLog "Failed to create README.txt: $_" -Level "WARN"
+    }
+}
+
+# ==================================================================
+#  ETW TRAFFIC SESSION MANAGEMENT
+#  Persistent real-time trace session logging every TCP/UDP Send/Recv
+#  with byte counts + owning PID, so the daily report can attribute
+#  traffic to the process that actually consumed it.
+# ==================================================================
+
+function Test-TrafficSessionExists {
+    # Returns $true if the logman trace session is registered (Running or Stopped)
+    try {
+        $null = logman query -name $TrafficSessionName 2>&1
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        return $false
+    }
+}
+
+function Test-TrafficSessionRunning {
+    try {
+        $query = logman query -name $TrafficSessionName 2>&1 | Out-String
+        return ($query -match 'Running|运行')
+    } catch {
+        return $false
+    }
+}
+
+function Initialize-TrafficSession {
+    Write-Host "--- Setting Up ETW Traffic Capture Session ---" -ForegroundColor Cyan
+    Write-RunLog "Initializing ETW traffic session [$TrafficSessionName]..."
+
+    # Ensure traffic directory exists
+    if (-not (Test-Path $TrafficEtlDir)) {
+        try {
+            New-Item -ItemType Directory -Path $TrafficEtlDir -Force | Out-Null
+            Write-RunLog "Created traffic ETL directory: $TrafficEtlDir"
+        } catch {
+            Write-RunLog "Failed to create traffic directory: $_" -Level "ERROR"
+            Write-Host "  [ERROR] Failed: $_" -ForegroundColor Red
+            return
+        }
+    }
+
+    $etlPath = Join-Path $TrafficEtlDir "traffic.etl"
+
+    # If a previous session exists, restart with current config
+    if (Test-TrafficSessionExists) {
+        Write-Host "  [INFO] Session already registered — recreating with current config..." -ForegroundColor Yellow
+        try { logman stop $TrafficSessionName 2>&1 | Out-Null } catch { }
+        try { logman delete $TrafficSessionName 2>&1 | Out-Null } catch { }
+    }
+
+    # Create persistent trace session:
+    #   -pf <file>     : enable MULTIPLE providers via a text file (logman does NOT
+    #                    accept two -p flags on the same command — "参数'p'定义的次数过多").
+    #                    File format: one provider per line as "<Name> <Keywords> <Level>"
+    #   -f bincirc     : binary circular log format — universally supported across
+    #                    all logman versions (the shorter -ctw flag is rejected on
+    #                    some localized Windows builds with "参数'ctw'未知").
+    #   -max <MB>      : max file size before wrap-around
+    #   -o <path>      : ETL output (without extension; logman appends .etl)
+    #   -ets is NOT used — we want the session persisted in the registry so it
+    #   survives reboots and can be re-started by the boot task.
+    $providersFile = Join-Path $TrafficEtlDir "providers.txt"
+    $netKW  = '0x{0:X}' -f $TrafficNetworkKW
+    $procKW = '0x{0:X}' -f $TrafficProcessKW
+    $providerLines = @(
+        "Microsoft-Windows-Kernel-Network $netKW $($TrafficNetworkLV)",
+        "Microsoft-Windows-Kernel-Process $procKW $($TrafficProcessLV)"
+    )
+    try {
+        $providerLines | Out-File -FilePath $providersFile -Encoding ASCII -Force
+        Write-RunLog "Wrote providers.txt with $($providerLines.Count) providers."
+    } catch {
+        Write-RunLog "Failed to write providers.txt: $_" -Level "ERROR"
+        Write-Host "  [ERROR] $_" -ForegroundColor Red
+        return
+    }
+
+    $etlBasePath = Join-Path $TrafficEtlDir "traffic"
+    # NOTE: avoid $args — it's a PowerShell automatic variable (collides with the
+    # function's implicit args array). Use $lmArgs instead.
+    $lmArgs = @(
+        "create", "trace", $TrafficSessionName,
+        "-pf", $providersFile,
+        "-o", $etlBasePath,
+        "-f", "bincirc",
+        "-max", $TrafficEtlMaxMB
+    )
+    Write-RunLog "Running: logman $($lmArgs -join ' ')"
+    $createOut = & logman @lmArgs 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        Write-RunLog "logman create failed (exit=$LASTEXITCODE): $createOut" -Level "ERROR"
+        Write-Host "  [ERROR] logman create failed: $createOut" -ForegroundColor Red
+        Write-Host "         Try manually: logman create trace $TrafficSessionName -pf `"$providersFile`" -o `"$etlBasePath`" -f bincirc -max $TrafficEtlMaxMB" -ForegroundColor Yellow
+        return
+    }
+    Write-RunLog "logman trace session created."
+
+    # Start the session
+    $startOut = & logman start $TrafficSessionName 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        Write-RunLog "logman start failed (exit=$LASTEXITCODE): $startOut" -Level "ERROR"
+        Write-Host "  [ERROR] logman start failed: $startOut" -ForegroundColor Red
+        return
+    }
+    Write-RunLog "ETW traffic session started. ETL: $etlPath (max $TrafficEtlMaxMB MB, circular)"
+    Write-Host "  [OK] ETW traffic session started" -ForegroundColor Green
+    Write-Host "       ETL: $etlPath (max ${TrafficEtlMaxMB}MB circular)" -ForegroundColor Gray
+}
+
+function Ensure-TrafficSession {
+    # Idempotent guard: if the session isn't running (e.g. after a reboot the boot
+    # task hasn't fired yet, or someone stopped it), start it. Called at the head
+    # of Export to guarantee there's always data to archive.
+    if (-not (Test-TrafficSessionExists)) {
+        Write-RunLog "Traffic session [$TrafficSessionName] not registered — skipping Ensure (run Init first)." -Level "WARN"
+        return $false
+    }
+    if (Test-TrafficSessionRunning) {
+        return $true
+    }
+    Write-RunLog "Traffic session not running — starting..."
+    try {
+        & logman start $TrafficSessionName 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-RunLog "Traffic session started by Ensure-TrafficSession."
+            return $true
+        } else {
+            Write-RunLog "logman start returned exit code $LASTEXITCODE." -Level "WARN"
+            return $false
+        }
+    } catch {
+        Write-RunLog "Ensure-TrafficSession exception: $_" -Level "WARN"
+        return $false
     }
 }
 
@@ -987,6 +1186,186 @@ function Get-Sysmon11 {
     }
 }
 
+function Get-TrafficBytes {
+    param([DateTime]$StartTime, [DateTime]$EndTime)
+    <#
+        .SYNOPSIS
+        Archives the live ETW traffic ETL, restarts the session, then parses the
+        archived ETL to extract per-event Send/Recv bytes with owning PID.
+        .DESCRIPTION
+        Workflow:
+          1. If the trace session is running: stop it, move traffic.etl to a
+             timestamped archive, restart the session so capture resumes.
+          2. Parse the archived ETL with Get-WinEvent to extract:
+             - Microsoft-Windows-Kernel-Network Event 3 (Send) / 4 (Recv) → bytes + PID
+             - Microsoft-Windows-Kernel-Process Event 1 (ProcessStart) → PID -> ImagePath
+          3. Returns one PSCustomObject per Send/Recv event, filtered to [StartTime, EndTime].
+        .OUTPUTS
+        [PSCustomObject[]] with Time/PID/ProcessName/Direction/Bytes
+    #>
+    try {
+        Write-RunLog "Collecting ETW traffic data (Kernel-Network Send/Recv)..."
+        $etlPath = Join-Path $TrafficEtlDir "traffic.etl"
+
+        # ---- Step 1: archive the live ETL and restart the session ----
+        $archiveEtl = $null
+
+        if (Test-TrafficSessionExists) {
+            if (Test-TrafficSessionRunning) {
+                Write-RunLog "  Stopping traffic session to archive ETL..."
+                & logman stop $TrafficSessionName 2>&1 | Out-Null
+                Start-Sleep -Milliseconds 800  # let the ETL file handle release
+            }
+
+            if (Test-Path $etlPath) {
+                $stamp = [DateTime]::Now.ToString('yyyyMMddHHmmss')
+                $archiveEtl = Join-Path $TrafficEtlDir "traffic-$stamp.etl"
+                try {
+                    Move-Item -Path $etlPath -Destination $archiveEtl -Force -ErrorAction Stop
+                    Write-RunLog "  Archived ETL: $archiveEtl"
+                } catch {
+                    Write-RunLog "  Move failed, trying copy: $_" -Level "WARN"
+                    try {
+                        Copy-Item -Path $etlPath -Destination $archiveEtl -Force -ErrorAction Stop
+                        Remove-Item -Path $etlPath -Force -ErrorAction SilentlyContinue
+                    } catch {
+                        Write-RunLog "  Copy also failed, reading in place: $_" -Level "WARN"
+                        $archiveEtl = $etlPath
+                    }
+                }
+            } else {
+                Write-RunLog "  No live ETL at $etlPath (first run after Init?)" -Level "WARN"
+                & logman start $TrafficSessionName 2>&1 | Out-Null
+                return @()
+            }
+
+            # Restart the session to resume capture for the next interval
+            & logman start $TrafficSessionName 2>&1 | Out-Null
+            Write-RunLog "  Traffic session restarted."
+        } elseif (Test-Path $etlPath) {
+            # Session not registered but a stale ETL exists — archive and use it
+            $stamp = [DateTime]::Now.ToString('yyyyMMddHHmmss')
+            $archiveEtl = Join-Path $TrafficEtlDir "traffic-$stamp.etl"
+            try {
+                Move-Item -Path $etlPath -Destination $archiveEtl -Force -ErrorAction Stop
+            } catch {
+                $archiveEtl = $etlPath
+            }
+        } else {
+            Write-RunLog "  ETW session not registered and no ETL found. Skipping traffic collection. Run -Mode Init first." -Level "WARN"
+            return @()
+        }
+
+        if (-not $archiveEtl -or -not (Test-Path $archiveEtl)) {
+            Write-RunLog "  Archived ETL not accessible: $archiveEtl" -Level "WARN"
+            return @()
+        }
+
+        # ---- Step 2: parse the archived ETL ----
+        Write-RunLog "  Parsing ETL: $archiveEtl"
+        # Cap to 1M events to bound memory; warn if hit.
+        $events = Get-WinEvent -Path $archiveEtl -Oldest -MaxEvents 1000000 -ErrorAction Stop
+
+        $pidNameMap = @{}        # PID -> process name (from Kernel-Process ImageLoad)
+        $trafficEvents = @()     # Send/Recv event records
+
+        foreach ($evt in $events) {
+            $provName = $evt.ProviderName
+            $evtId    = $evt.Id
+
+            # ---- Kernel-Process ImageLoad / ProcessStart: build PID -> ProcessName ----
+            # Event ID 5 is Image Load (DLL/exe mapped into a process) — it carries
+            # ProcessID + ImageFileName, the most reliable source of "PID -> name"
+            # for processes that started BEFORE the trace session began.
+            if ($provName -match 'Kernel-Process|KernelProcess') {
+                if ($evtId -eq 5 -or $evtId -eq 1) {
+                    try {
+                        $xml = [xml]$evt.ToXml()
+                        $data = @{}
+                        $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
+
+                        $procId = 0
+                        foreach ($k in @('ProcessID','ProcessId','PID')) {
+                            if ($data[$k]) { try { $procId = [int]$data[$k]; break } catch { } }
+                        }
+                        if ($procId -eq 0 -and $evt.ProcessId) { $procId = [int]$evt.ProcessId }
+
+                        $imgPath = $null
+                        foreach ($k in @('ImageFileName','ImageName','FileName','ImagePath','Image','ImageBase')) {
+                            if ($data[$k]) { $imgPath = $data[$k]; break }
+                        }
+
+                        if ($procId -gt 0 -and $imgPath -and -not $pidNameMap.ContainsKey($procId)) {
+                            $pidNameMap[$procId] = (Split-Path -Leaf $imgPath)
+                        }
+                    } catch { }
+                }
+                continue
+            }
+
+            # ---- Kernel-Network Send (3) / Recv (4): the bytes we want ----
+            if ($provName -match 'Kernel-Network|KernelNetwork') {
+                if ($evtId -eq 3 -or $evtId -eq 4) {
+                    # Filter to the requested time range first (cheap)
+                    if ($evt.TimeCreated -lt $StartTime -or $evt.TimeCreated -gt $EndTime) {
+                        continue
+                    }
+                    try {
+                        $xml = [xml]$evt.ToXml()
+                        $data = @{}
+                        $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
+
+                        $size = [long]0
+                        foreach ($k in @('size','Size','bytes','Bytes','sizebytes','ByteCount')) {
+                            if ($data[$k]) { try { $size = [long]$data[$k]; break } catch { } }
+                        }
+
+                        $procId = 0
+                        foreach ($k in @('PID','ProcessID','ProcessId')) {
+                            if ($data[$k]) { try { $procId = [int]$data[$k]; break } catch { } }
+                        }
+                        if ($procId -eq 0 -and $evt.ProcessId) { $procId = [int]$evt.ProcessId }
+
+                        $trafficEvents += [PSCustomObject]@{
+                            Time        = $evt.TimeCreated
+                            PID         = $procId
+                            ProcessName = ""
+                            Direction   = if ($evtId -eq 3) { "Sent" } else { "Recv" }
+                            Bytes       = $size
+                        }
+                    } catch { }
+                }
+            }
+        }
+        Write-RunLog "  Parsed $($trafficEvents.Count) Send/Recv events (PID map size: $($pidNameMap.Count))."
+
+        # ---- Step 3: attach process names ----
+        foreach ($evt in $trafficEvents) {
+            if ($pidNameMap.ContainsKey($evt.PID)) {
+                $evt.ProcessName = $pidNameMap[$evt.PID]
+            } else {
+                $evt.ProcessName = Get-ProcessNameByPID -ProcId $evt.PID
+            }
+        }
+
+        # Cleanup: delete the archived ETL after successful parse to bound disk usage
+        # (the live ETL is the source of truth for the next interval)
+        try {
+            Remove-Item -Path $archiveEtl -Force -ErrorAction SilentlyContinue
+        } catch { }
+
+        return $trafficEvents
+    } catch [System.Exception] {
+        # Get-WinEvent throws "No events were found..." on empty ETLs — treat as empty
+        if ($_.Exception.Message -match 'No events were found|没有事件') {
+            Write-RunLog "  Archived ETL was empty — no traffic to report."
+            return @()
+        }
+        Write-RunLog "Failed to collect traffic data: $_" -Level "WARN"
+        return @()
+    }
+}
+
 # ==================================================================
 #  STATISTICS FUNCTIONS
 # ==================================================================
@@ -1032,6 +1411,54 @@ function Get-Top10ProcessByConnection {
             UniqueIPs   = $ipCount
         }
     }
+    for ($i = 0; $i -lt $results.Count; $i++) { $results[$i].Rank = $i + 1 }
+    return $results
+}
+
+function Get-Top10ProcessByTraffic {
+    param([object[]]$TrafficEvents)
+    <#
+        .SYNOPSIS
+        Aggregate Send/Recv events per process, rank by total bytes.
+        .OUTPUTS
+        [PSCustomObject[]] with Rank/ProcessName/SentBytes/RecvBytes/TotalBytes/EventCount/Percent
+    #>
+    if (-not $TrafficEvents -or $TrafficEvents.Count -eq 0) { return @() }
+
+    # Aggregate per process name (PID may repeat with different names if a PID was reused,
+    # but ProcessName is the stable user-facing label)
+    $agg = @{}
+    $grandTotal = [long]0
+    foreach ($e in $TrafficEvents) {
+        $name = if ($e.ProcessName) { $e.ProcessName } else { "PID:$($e.PID)" }
+        if (-not $agg.ContainsKey($name)) {
+            $agg[$name] = @{ Sent = [long]0; Recv = [long]0; Count = 0 }
+        }
+        if ($e.Direction -eq "Sent") {
+            $agg[$name].Sent += [long]$e.Bytes
+        } else {
+            $agg[$name].Recv += [long]$e.Bytes
+        }
+        $agg[$name].Count++
+        $grandTotal += [long]$e.Bytes
+    }
+
+    $results = @()
+    foreach ($k in $agg.Keys) {
+        $total = $agg[$k].Sent + $agg[$k].Recv
+        $pct = if ($grandTotal -gt 0) { [math]::Round(($total / $grandTotal) * 100, 2) } else { 0 }
+        $results += [PSCustomObject]@{
+            Rank         = 0
+            ProcessName  = $k
+            SentBytes    = $agg[$k].Sent
+            RecvBytes    = $agg[$k].Recv
+            TotalBytes   = $total
+            EventCount   = $agg[$k].Count
+            Percent      = $pct
+        }
+    }
+
+    $results = $results | Sort-Object TotalBytes -Descending | Select-Object -First 10
     for ($i = 0; $i -lt $results.Count; $i++) { $results[$i].Rank = $i + 1 }
     return $results
 }
@@ -1326,6 +1753,7 @@ function Write-Report {
         [object[]]$Sysmon1,
         [object[]]$Sysmon3,
         [object[]]$Sysmon11,
+        [object[]]$TrafficEvents,
         [string]$OutputFile
     )
 
@@ -1335,6 +1763,7 @@ function Write-Report {
     # Calculate stats
     $connStats = Get-ConnectionStats -Security5156 $Security5156 -Sysmon3 $Sysmon3
     $top10Proc = Get-Top10ProcessByConnection -Security5156 $Security5156 -Sysmon3 $Sysmon3
+    $top10Traffic = Get-Top10ProcessByTraffic -TrafficEvents $TrafficEvents
     $top10Domain = Get-Top10Domain -DNS3008 $DNS3008
     $top10File = Get-Top10FileCreate -Sysmon11 $Sysmon11
 
@@ -1380,9 +1809,31 @@ function Write-Report {
     [void]$sb.AppendLine("  涉及独立域名 Unique Domains    : $uniqueDomains")
     [void]$sb.AppendLine("")
 
-    # TOP 10 Processes
+    # TOP 10 Processes by Traffic (bytes) — the real "who is eating bandwidth" table
+    if ($top10Traffic.Count -gt 0) {
+        [void]$sb.AppendLine("【流量 TOP 10 进程 Top 10 Processes by Traffic (Bytes)】")
+        [void]$sb.AppendLine((Format-FixedWidth -Columns @("排名", "进程名", "上传 Sent", "下载 Recv", "总流量 Total", "占比%") -Widths @(6, 28, 14, 14, 14, 8)))
+        [void]$sb.AppendLine((Format-FixedWidth -Columns @("----", "--------", "----------", "----------", "------------", "------") -Widths @(6, 28, 14, 14, 14, 8)))
+        foreach ($proc in $top10Traffic) {
+            $sentStr = Format-BytesForReport -Bytes $proc.SentBytes
+            $recvStr = Format-BytesForReport -Bytes $proc.RecvBytes
+            $totalStr = Format-BytesForReport -Bytes $proc.TotalBytes
+            [void]$sb.AppendLine((Format-FixedWidth -Columns @(
+                $proc.Rank.ToString(),
+                $proc.ProcessName,
+                $sentStr,
+                $recvStr,
+                $totalStr,
+                "$($proc.Percent)%"
+            ) -Widths @(6, 28, 14, 14, 14, 8)))
+        }
+        [void]$sb.AppendLine("")
+    }
+
+    # TOP 10 Processes by connection count (renamed from "流量 TOP 10" — it was misleading:
+    # "连接次数" tells you who connects often, not who transfers bytes)
     if ($top10Proc.Count -gt 0) {
-        [void]$sb.AppendLine("【流量 TOP 10 进程 Top 10 Processes by Connection】")
+        [void]$sb.AppendLine("【连接 TOP 10 进程 Top 10 Processes by Connection Count】")
         [void]$sb.AppendLine((Format-FixedWidth -Columns @("排名", "进程名", "连接数", "出站", "入站", "涉及IP数") -Widths @(6, 28, 10, 8, 8, 10)))
         [void]$sb.AppendLine((Format-FixedWidth -Columns @("----", "--------", "------", "----", "----", "--------") -Widths @(6, 28, 10, 8, 8, 10)))
         foreach ($proc in $top10Proc) {
@@ -1702,6 +2153,35 @@ function Show-Status {
         Write-Host "  DNS日志状态 DNS Client Log : 无法检测 Cannot detect" -ForegroundColor Red
     }
 
+    # ETW traffic session status
+    try {
+        if (Test-TrafficSessionExists) {
+            if (Test-TrafficSessionRunning) {
+                $etlPath = Join-Path $TrafficEtlDir "traffic.etl"
+                $sizeStr = "N/A"
+                if (Test-Path $etlPath) {
+                    $sz = (Get-Item $etlPath -ErrorAction SilentlyContinue).Length
+                    if ($sz) { $sizeStr = Format-BytesForReport -Bytes $sz }
+                }
+                Write-Host "  ETW会话状态 Traffic Session : 运行中 Running (ETL: $sizeStr / max ${TrafficEtlMaxMB}MB circular)" -ForegroundColor Green
+            } else {
+                Write-Host "  ETW会话状态 Traffic Session : 已注册但未运行 Registered but stopped" -ForegroundColor Yellow
+            }
+        } else {
+            Write-Host "  ETW会话状态 Traffic Session : 未注册 Not registered (run Init to enable per-process traffic capture)" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "  ETW会话状态 Traffic Session : 无法检测 Cannot detect" -ForegroundColor Red
+    }
+
+    # Traffic boot task status
+    $trafficTask = Get-ScheduledTask -TaskName $TrafficTaskName -ErrorAction SilentlyContinue
+    if ($trafficTask) {
+        Write-Host "  开机任务状态 Boot Traffic Task : 已注册 Registered (State: $($trafficTask.State))" -ForegroundColor Green
+    } else {
+        Write-Host "  开机任务状态 Boot Traffic Task : 未注册 Not registered" -ForegroundColor Red
+    }
+
     # Task scheduler status
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($task) {
@@ -1795,6 +2275,8 @@ switch ($Mode) {
         Write-Host ""
         Initialize-DirectoryStructure
         Write-Host ""
+        Initialize-TrafficSession
+        Write-Host ""
         Initialize-TaskScheduler
         Write-Host ""
         Initialize-Readme
@@ -1850,25 +2332,34 @@ switch ($Mode) {
             New-Item -ItemType Directory -Path $LogsDir -Force | Out-Null
         }
 
-        # Collect data from all 6 sources
+        # Ensure the ETW traffic session is running before collecting —
+        # if Init ran but a reboot happened in between and the boot task hasn't
+        # fired yet, this is the fallback that guarantees capture.
+        Write-Host "  Ensuring ETW traffic session is running..." -ForegroundColor Gray
+        Ensure-TrafficSession | Out-Null
+
+        # Collect data from all 7 sources
         Write-Host ""
-        Write-Host "  [1/6] Collecting Security 5156 (Network Connection)..." -ForegroundColor Gray
+        Write-Host "  [1/7] Collecting Security 5156 (Network Connection)..." -ForegroundColor Gray
         $sec5156 = Get-Security5156 -StartTime $dateRange.Start -EndTime $dateRange.End
 
-        Write-Host "  [2/6] Collecting Security 4688 (Process Creation)..." -ForegroundColor Gray
+        Write-Host "  [2/7] Collecting Security 4688 (Process Creation)..." -ForegroundColor Gray
         $sec4688 = Get-Security4688 -StartTime $dateRange.Start -EndTime $dateRange.End
 
-        Write-Host "  [3/6] Collecting DNS 3008 (DNS Query)..." -ForegroundColor Gray
+        Write-Host "  [3/7] Collecting DNS 3008 (DNS Query)..." -ForegroundColor Gray
         $dns3008 = Get-DNS3008 -StartTime $dateRange.Start -EndTime $dateRange.End
 
-        Write-Host "  [4/6] Collecting Sysmon 1 (Process Creation)..." -ForegroundColor Gray
+        Write-Host "  [4/7] Collecting Sysmon 1 (Process Creation)..." -ForegroundColor Gray
         $sys1 = Get-Sysmon1 -StartTime $dateRange.Start -EndTime $dateRange.End
 
-        Write-Host "  [5/6] Collecting Sysmon 3 (Network Connection)..." -ForegroundColor Gray
+        Write-Host "  [5/7] Collecting Sysmon 3 (Network Connection)..." -ForegroundColor Gray
         $sys3 = Get-Sysmon3 -StartTime $dateRange.Start -EndTime $dateRange.End
 
-        Write-Host "  [6/6] Collecting Sysmon 11 (File Creation)..." -ForegroundColor Gray
+        Write-Host "  [6/7] Collecting Sysmon 11 (File Creation)..." -ForegroundColor Gray
         $sys11 = Get-Sysmon11 -StartTime $dateRange.Start -EndTime $dateRange.End
+
+        Write-Host "  [7/7] Collecting ETW traffic (Kernel-Network Send/Recv)..." -ForegroundColor Gray
+        $traffic = Get-TrafficBytes -StartTime $dateRange.Start -EndTime $dateRange.End
 
         # Generate report(s)
         Write-Host ""
@@ -1894,9 +2385,10 @@ switch ($Mode) {
                 -Sysmon1 $sys1 `
                 -Sysmon3 $sys3 `
                 -Sysmon11 $sys11 `
+                -TrafficEvents $traffic `
                 -OutputFile $outputFile
 
-            $totalRecords = $sec5156.Count + $sec4688.Count + $dns3008.Count + $sys1.Count + $sys3.Count + $sys11.Count
+            $totalRecords = $sec5156.Count + $sec4688.Count + $dns3008.Count + $sys1.Count + $sys3.Count + $sys11.Count + $traffic.Count
             $totalFiles = 1
             $outputFiles = @($outputFile)
         } else {
@@ -1909,7 +2401,7 @@ switch ($Mode) {
 
             # Diagnostic: show actual event time span from collected data
             $allTimes = @()
-            foreach ($arr in @($sec5156, $sec4688, $dns3008, $sys1, $sys3, $sys11)) {
+            foreach ($arr in @($sec5156, $sec4688, $dns3008, $sys1, $sys3, $sys11, $traffic)) {
                 foreach ($e in $arr) { if ($e.Time) { $allTimes += $e.Time } }
             }
             if ($allTimes.Count -gt 0) {
@@ -1932,8 +2424,9 @@ switch ($Mode) {
                 $day1    = Filter-ByDay -Events $sys1    -DayStart $dayStart -DayEnd $dayEnd
                 $day3    = Filter-ByDay -Events $sys3    -DayStart $dayStart -DayEnd $dayEnd
                 $day11   = Filter-ByDay -Events $sys11   -DayStart $dayStart -DayEnd $dayEnd
+                $dayTraffic = Filter-ByDay -Events $traffic -DayStart $dayStart -DayEnd $dayEnd
 
-                $dayTotal = $day5156.Count + $day4688.Count + $day3008.Count + $day1.Count + $day3.Count + $day11.Count
+                $dayTotal = $day5156.Count + $day4688.Count + $day3008.Count + $day1.Count + $day3.Count + $day11.Count + $dayTraffic.Count
                 $isPartial = ($dayStart -ne $currentDay) -or ($dayEnd -ne $dayEndFull)
                 $dayLabel = if ($isPartial) { "（部分 Partial）" } else { "" }
 
@@ -1949,6 +2442,7 @@ switch ($Mode) {
                         -Sysmon1 $day1 `
                         -Sysmon3 $day3 `
                         -Sysmon11 $day11 `
+                        -TrafficEvents $dayTraffic `
                         -OutputFile $dayFile
 
                     $totalRecords += $dayTotal

@@ -5,7 +5,7 @@
 
 ## Overview
 
-NetLedger is a Windows network traffic monitoring and log collection system implemented entirely in PowerShell. It collects events from 6 data sources across Windows Event Logs and Sysmon, aggregates them into a human-readable daily report, and supports anomaly detection.
+NetLedger is a Windows network traffic monitoring and log collection system implemented entirely in PowerShell. It collects events from 6 data sources across Windows Event Logs and Sysmon, **plus a persistent ETW trace session** that attributes actual byte counts to processes, aggregates them into a human-readable daily report, and supports anomaly detection.
 
 ## Architecture Diagram
 
@@ -82,6 +82,9 @@ Six independent collectors, each with its own try-catch. Failure in one does not
 | `Get-Sysmon1` | Sysmon | 1 | `Get-WinEvent -FilterHashtable` |
 | `Get-Sysmon3` | Sysmon | 3 | `Get-WinEvent -FilterHashtable` |
 | `Get-Sysmon11` | Sysmon | 11 | `Get-WinEvent -FilterHashtable` |
+| `Get-TrafficBytes` | ETL (Kernel-Network + Kernel-Process) | 3 (Send) / 4 (Recv) + 1/5 (ImageLoad) | `Get-WinEvent -Path <archive.etl>` |
+
+The 7th collector (`Get-TrafficBytes`) differs from the other six: instead of querying Windows Event Logs, it archives and parses a **live ETL** produced by a persistent ETW trace session (`NetLedgerTraffic`) created during Init. See the "ETW Traffic Session" section below.
 
 **Key Design Decision**: Use `-FilterHashtable` (not `-FilterXml`) because:
 - Provider-side filtering reduces data transfer from ETW
@@ -89,6 +92,8 @@ Six independent collectors, each with its own try-catch. Failure in one does not
 - `-MaxEvents` parameter caps memory usage at 50,000 events per source
 
 **Sysmon Fallback**: If `Test-SysmonAvailable` returns false, Sysmon collectors return empty arrays without errors.
+
+**ETW Fallback**: If `Test-TrafficSessionExists` returns false (Init never ran, or session was deleted), `Get-TrafficBytes` returns an empty array and logs a WARN — the rest of the report is unaffected.
 
 **XML Parsing Pattern**: All collectors use a consistent pattern:
 ```powershell
@@ -121,13 +126,39 @@ All detectors return arrays (empty if no anomalies). Report generation handles e
 ### 7. Formatting Subsystem (Lines ~672-840)
 `Write-Report` function generates the complete daily report using `StringBuilder` for performance:
 1. Header block (timestamp, computer name)
-2. Part 1: Statistics Summary (connection stats, TOP10 tables, new domains)
+2. Part 1: Statistics Summary (connection stats, **TOP10 by Traffic bytes**, TOP10 by Connection count, TOP10 domains, TOP10 file creation, new domains)
 3. Anomaly Alerts section (conditionally generated)
 4. Part 2: Connection Details (all 5156 + Sysmon3 events)
 5. Part 3: DNS Query Details (all 3008 events)
 6. Part 4: File Creation Details (all Sysmon11 events)
 7. Part 5: Process Creation Details (all 4688 + Sysmon1 events)
 8. Footer (file size, total records)
+
+### 8. ETW Traffic Session Subsystem (added in v1.1)
+
+A persistent real-time ETW trace session (`NetLedgerTraffic`) is the only component in the system that records **byte counts**, not just connection events. It is the architectural answer to "which process is eating bandwidth".
+
+**Components**:
+
+| Function | Purpose |
+|----------|---------|
+| `Initialize-TrafficSession` | Init mode: `logman create trace NetLedgerTraffic -p Microsoft-Windows-Kernel-Network ... -p Microsoft-Windows-Kernel-Process ... -ctw -max 256`, then `logman start` |
+| `Ensure-TrafficSession` | Idempotent guard called at the head of every Export — restarts the session if it died (e.g. between boot and Export) |
+| `Test-TrafficSessionExists` / `Test-TrafficSessionRunning` | Session state probes via `logman query` |
+| `Get-TrafficBytes` | Export mode: stop session → archive `traffic.etl` → restart session → parse archived ETL → return Send/Recv events with PID + bytes |
+| `Get-Top10ProcessByTraffic` | Statistics: aggregate Send/Recv bytes per process, rank by total bytes |
+
+**Boot-time recovery**: a standalone scheduled task `NetLedger_TrafficSessionAtBoot` runs `logman start` 30 seconds after every boot, so capture resumes immediately rather than waiting for the next 00:30 Export.
+
+**Lifecycle vs Export**:
+- During the day the ETL grows (circular, max 256 MB).
+- At Export time, the live session is **stopped**, the ETL is moved to `traffic-{yyyyMMddHHmmss}.etl`, then the session is restarted. The archived ETL is parsed for events in the requested `[StartTime, EndTime]` window, then deleted.
+- ~1 second of network events are lost during the stop/restart window — accepted as a deliberate trade-off (see DD-011).
+
+**PID → ProcessName resolution**:
+- Primary source: `Microsoft-Windows-Kernel-Process` Event 5 (ImageLoad) which carries `ProcessID + ImageFileName` for every executable mapped into a process — this catches processes that started **before** the trace session.
+- Fallback: `Get-Process -Id <pid>` (only works if the process is still alive at Export time).
+- Edge case: PID reuse. The map is keyed by PID with last-write-wins semantics — imperfect but rarely wrong in practice.
 
 ## Data Flow
 
