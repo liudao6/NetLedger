@@ -798,13 +798,35 @@ function Initialize-TrafficSession {
         }
     }
 
-    $etlPath = Join-Path $TrafficEtlDir "traffic.etl"
+    # NOTE: no fixed ETL path here — logman appends a version suffix
+    # (traffic_000001.etl), so all consumers glob traffic*.etl instead.
 
     # If a previous session exists, restart with current config
     if (Test-TrafficSessionExists) {
         Write-Host "  [INFO] Session already registered — recreating with current config..." -ForegroundColor Yellow
         try { logman stop $TrafficSessionName 2>&1 | Out-Null } catch { }
         try { logman delete $TrafficSessionName 2>&1 | Out-Null } catch { }
+        Start-Sleep -Milliseconds 800  # let the old ETL file handle release
+    }
+
+    # Leftover live ETLs from a previous session make `logman start` fail with
+    # ERROR_ALREADY_EXISTS ("当文件已存在时，无法创建该文件") — logman appends a
+    # version suffix (traffic_000001.etl) and refuses to reuse the file. Move
+    # them into timestamped archives; the next Export will parse and delete them.
+    $leftovers = @(Get-ChildItem -Path (Join-Path $TrafficEtlDir "traffic*.etl") -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -notmatch '^traffic-' })
+    if ($leftovers.Count -gt 0) {
+        $stamp = [DateTime]::Now.ToString('yyyyMMddHHmmss')
+        $n = 0
+        foreach ($lf in $leftovers) {
+            $n++
+            try {
+                Move-Item -Path $lf.FullName -Destination (Join-Path $TrafficEtlDir "traffic-$stamp-$n.etl") -Force -ErrorAction Stop
+            } catch {
+                Write-RunLog "Could not archive leftover ETL $($lf.Name): $_" -Level "WARN"
+            }
+        }
+        Write-RunLog "Archived $n leftover live ETL file(s) to unblock logman start."
     }
 
     # Create persistent trace session:
@@ -861,9 +883,10 @@ function Initialize-TrafficSession {
         Write-Host "  [ERROR] logman start failed: $startOut" -ForegroundColor Red
         return
     }
-    Write-RunLog "ETW traffic session started. ETL: $etlPath (max $TrafficEtlMaxMB MB, circular)"
+    # logman appends a version suffix, so the live file is traffic_000001.etl
+    Write-RunLog "ETW traffic session started. ETL: $etlBasePath`_NNNNNN.etl (max $TrafficEtlMaxMB MB, circular)"
     Write-Host "  [OK] ETW traffic session started" -ForegroundColor Green
-    Write-Host "       ETL: $etlPath (max ${TrafficEtlMaxMB}MB circular)" -ForegroundColor Gray
+    Write-Host "       ETL: $etlBasePath`_NNNNNN.etl (max ${TrafficEtlMaxMB}MB circular)" -ForegroundColor Gray
 }
 
 function Ensure-TrafficSession {
@@ -883,10 +906,29 @@ function Ensure-TrafficSession {
         if ($LASTEXITCODE -eq 0) {
             Write-RunLog "Traffic session started by Ensure-TrafficSession."
             return $true
-        } else {
-            Write-RunLog "logman start returned exit code $LASTEXITCODE." -Level "WARN"
-            return $false
         }
+
+        # Most common failure: leftover live ETLs block the start with
+        # ERROR_ALREADY_EXISTS. Archive them (Export will parse the archives)
+        # and retry once.
+        Write-RunLog "logman start returned exit code $LASTEXITCODE — archiving leftover ETLs and retrying..." -Level "WARN"
+        $leftovers = @(Get-ChildItem -Path (Join-Path $TrafficEtlDir "traffic*.etl") -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -notmatch '^traffic-' })
+        $stamp = [DateTime]::Now.ToString('yyyyMMddHHmmss')
+        $n = 0
+        foreach ($lf in $leftovers) {
+            $n++
+            try {
+                Move-Item -Path $lf.FullName -Destination (Join-Path $TrafficEtlDir "traffic-$stamp-$n.etl") -Force -ErrorAction Stop
+            } catch { }
+        }
+        & logman start $TrafficSessionName 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Write-RunLog "Traffic session started after archiving $n leftover ETL(s)."
+            return $true
+        }
+        Write-RunLog "logman start still failing (exit code $LASTEXITCODE)." -Level "WARN"
+        return $false
     } catch {
         Write-RunLog "Ensure-TrafficSession exception: $_" -Level "WARN"
         return $false
@@ -1194,146 +1236,186 @@ function Get-TrafficBytes {
         archived ETL to extract per-event Send/Recv bytes with owning PID.
         .DESCRIPTION
         Workflow:
-          1. If the trace session is running: stop it, move traffic.etl to a
-             timestamped archive, restart the session so capture resumes.
-          2. Parse the archived ETL with Get-WinEvent to extract:
-             - Microsoft-Windows-Kernel-Network Event 3 (Send) / 4 (Recv) → bytes + PID
-             - Microsoft-Windows-Kernel-Process Event 1 (ProcessStart) → PID -> ImagePath
+          1. If the trace session is running: stop it, move ALL live traffic*.etl
+             files to timestamped archives (logman appends version suffixes like
+             traffic_000001.etl — never assume a fixed name), restart the session.
+             Also picks up orphaned traffic-*.etl archives from previous runs.
+          2. Parse the archived ETL(s) with Get-WinEvent to extract:
+             - Microsoft-Windows-Kernel-Network TCP/UDP Send (10/26/42/58) and
+               Recv (11/27/43/59) events → bytes + PID (from event PAYLOAD;
+               the event header PID is the kernel's, always 4/System)
+             - Microsoft-Windows-Kernel-Process Event 5/1 (ImageLoad/ProcessStart) → PID -> ImagePath
           3. Returns one PSCustomObject per Send/Recv event, filtered to [StartTime, EndTime].
         .OUTPUTS
         [PSCustomObject[]] with Time/PID/ProcessName/Direction/Bytes
     #>
     try {
         Write-RunLog "Collecting ETW traffic data (Kernel-Network Send/Recv)..."
-        $etlPath = Join-Path $TrafficEtlDir "traffic.etl"
 
-        # ---- Step 1: archive the live ETL and restart the session ----
-        $archiveEtl = $null
+        # Live ETL discovery: logman appends a version suffix by default, so the
+        # live file is traffic_000001.etl (NOT traffic.etl). Glob traffic*.etl and
+        # exclude our own timestamped archives (traffic-<stamp>-<n>.etl).
+        $getLiveEtls = {
+            @(Get-ChildItem -Path (Join-Path $TrafficEtlDir "traffic*.etl") -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -notmatch '^traffic-' })
+        }
 
-        if (Test-TrafficSessionExists) {
-            if (Test-TrafficSessionRunning) {
-                Write-RunLog "  Stopping traffic session to archive ETL..."
-                & logman stop $TrafficSessionName 2>&1 | Out-Null
-                Start-Sleep -Milliseconds 800  # let the ETL file handle release
-            }
+        # ---- Step 1: archive the live ETL(s) and restart the session ----
+        $archiveEtls = @()
+        $sessionExists = Test-TrafficSessionExists
 
-            if (Test-Path $etlPath) {
-                $stamp = [DateTime]::Now.ToString('yyyyMMddHHmmss')
-                $archiveEtl = Join-Path $TrafficEtlDir "traffic-$stamp.etl"
+        if ($sessionExists -and (Test-TrafficSessionRunning)) {
+            Write-RunLog "  Stopping traffic session to archive ETL..."
+            & logman stop $TrafficSessionName 2>&1 | Out-Null
+            Start-Sleep -Milliseconds 800  # let the ETL file handle release
+        }
+
+        $liveEtls = & $getLiveEtls
+        if ($liveEtls.Count -eq 0) {
+            Write-RunLog "  No live traffic*.etl under $TrafficEtlDir (first run after Init?)" -Level "WARN"
+        }
+        $stamp = [DateTime]::Now.ToString('yyyyMMddHHmmss')
+        $idx = 0
+        foreach ($live in $liveEtls) {
+            $idx++
+            $dest = Join-Path $TrafficEtlDir "traffic-$stamp-$idx.etl"
+            try {
+                Move-Item -Path $live.FullName -Destination $dest -Force -ErrorAction Stop
+                $archiveEtls += $dest
+                Write-RunLog "  Archived ETL: $dest"
+            } catch {
+                Write-RunLog "  Move failed, trying copy: $_" -Level "WARN"
                 try {
-                    Move-Item -Path $etlPath -Destination $archiveEtl -Force -ErrorAction Stop
-                    Write-RunLog "  Archived ETL: $archiveEtl"
+                    Copy-Item -Path $live.FullName -Destination $dest -Force -ErrorAction Stop
+                    Remove-Item -Path $live.FullName -Force -ErrorAction SilentlyContinue
+                    $archiveEtls += $dest
                 } catch {
-                    Write-RunLog "  Move failed, trying copy: $_" -Level "WARN"
-                    try {
-                        Copy-Item -Path $etlPath -Destination $archiveEtl -Force -ErrorAction Stop
-                        Remove-Item -Path $etlPath -Force -ErrorAction SilentlyContinue
-                    } catch {
-                        Write-RunLog "  Copy also failed, reading in place: $_" -Level "WARN"
-                        $archiveEtl = $etlPath
-                    }
+                    Write-RunLog "  Copy also failed, reading in place: $_" -Level "WARN"
+                    $archiveEtls += $live.FullName
                 }
-            } else {
-                Write-RunLog "  No live ETL at $etlPath (first run after Init?)" -Level "WARN"
-                & logman start $TrafficSessionName 2>&1 | Out-Null
-                return @()
             }
+        }
 
+        if ($sessionExists) {
             # Restart the session to resume capture for the next interval
+            # (live files were moved away first — otherwise logman start fails
+            # with ERROR_ALREADY_EXISTS)
             & logman start $TrafficSessionName 2>&1 | Out-Null
             Write-RunLog "  Traffic session restarted."
-        } elseif (Test-Path $etlPath) {
-            # Session not registered but a stale ETL exists — archive and use it
-            $stamp = [DateTime]::Now.ToString('yyyyMMddHHmmss')
-            $archiveEtl = Join-Path $TrafficEtlDir "traffic-$stamp.etl"
-            try {
-                Move-Item -Path $etlPath -Destination $archiveEtl -Force -ErrorAction Stop
-            } catch {
-                $archiveEtl = $etlPath
-            }
-        } else {
-            Write-RunLog "  ETW session not registered and no ETL found. Skipping traffic collection. Run -Mode Init first." -Level "WARN"
+        }
+
+        # Pick up orphaned archives (e.g. files archived by Init to unblock
+        # logman start, or left behind if a previous Export crashed mid-parse)
+        $orphans = @(Get-ChildItem -Path (Join-Path $TrafficEtlDir "traffic-*.etl") -ErrorAction SilentlyContinue |
+                     Where-Object { $archiveEtls -notcontains $_.FullName })
+        foreach ($o in $orphans) {
+            Write-RunLog "  Picking up orphaned archive: $($o.Name)"
+            $archiveEtls += $o.FullName
+        }
+
+        if ($archiveEtls.Count -eq 0) {
+            Write-RunLog "  No ETL data to parse. Run -Mode Init first if the session is missing." -Level "WARN"
             return @()
         }
 
-        if (-not $archiveEtl -or -not (Test-Path $archiveEtl)) {
-            Write-RunLog "  Archived ETL not accessible: $archiveEtl" -Level "WARN"
-            return @()
-        }
-
-        # ---- Step 2: parse the archived ETL ----
-        Write-RunLog "  Parsing ETL: $archiveEtl"
-        # Cap to 1M events to bound memory; warn if hit.
-        $events = Get-WinEvent -Path $archiveEtl -Oldest -MaxEvents 1000000 -ErrorAction Stop
+        # ---- Step 2: parse the archived ETL(s) ----
+        # Kernel-Network manifest event IDs (verified against a live capture —
+        # this provider does NOT use 3/4 for send/recv):
+        #   TCPv4 send/recv = 10/11    TCPv6 send/recv = 26/27
+        #   UDPv4 send/recv = 42/43    UDPv6 send/recv = 58/59
+        # 18 (TCP copy) is deliberately excluded — it would double-count bytes.
+        $sendIds = @(10, 26, 42, 58)
+        $recvIds = @(11, 27, 43, 59)
 
         $pidNameMap = @{}        # PID -> process name (from Kernel-Process ImageLoad)
-        $trafficEvents = @()     # Send/Recv event records
+        $trafficEvents = [System.Collections.Generic.List[object]]::new()
 
-        foreach ($evt in $events) {
-            $provName = $evt.ProviderName
-            $evtId    = $evt.Id
-
-            # ---- Kernel-Process ImageLoad / ProcessStart: build PID -> ProcessName ----
-            # Event ID 5 is Image Load (DLL/exe mapped into a process) — it carries
-            # ProcessID + ImageFileName, the most reliable source of "PID -> name"
-            # for processes that started BEFORE the trace session began.
-            if ($provName -match 'Kernel-Process|KernelProcess') {
-                if ($evtId -eq 5 -or $evtId -eq 1) {
-                    try {
-                        $xml = [xml]$evt.ToXml()
-                        $data = @{}
-                        $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
-
-                        $procId = 0
-                        foreach ($k in @('ProcessID','ProcessId','PID')) {
-                            if ($data[$k]) { try { $procId = [int]$data[$k]; break } catch { } }
-                        }
-                        if ($procId -eq 0 -and $evt.ProcessId) { $procId = [int]$evt.ProcessId }
-
-                        $imgPath = $null
-                        foreach ($k in @('ImageFileName','ImageName','FileName','ImagePath','Image','ImageBase')) {
-                            if ($data[$k]) { $imgPath = $data[$k]; break }
-                        }
-
-                        if ($procId -gt 0 -and $imgPath -and -not $pidNameMap.ContainsKey($procId)) {
-                            $pidNameMap[$procId] = (Split-Path -Leaf $imgPath)
-                        }
-                    } catch { }
+        foreach ($archiveEtl in $archiveEtls) {
+            Write-RunLog "  Parsing ETL: $archiveEtl"
+            $events = $null
+            try {
+                # Cap to 1M events per file to bound memory
+                $events = Get-WinEvent -Path $archiveEtl -Oldest -MaxEvents 1000000 -ErrorAction Stop
+            } catch {
+                if ($_.Exception.Message -match 'No events were found|没有事件') {
+                    Write-RunLog "  ETL was empty: $archiveEtl"
+                } else {
+                    Write-RunLog "  Failed to parse ETL ${archiveEtl}: $_" -Level "WARN"
                 }
                 continue
             }
 
-            # ---- Kernel-Network Send (3) / Recv (4): the bytes we want ----
-            if ($provName -match 'Kernel-Network|KernelNetwork') {
-                if ($evtId -eq 3 -or $evtId -eq 4) {
-                    # Filter to the requested time range first (cheap)
-                    if ($evt.TimeCreated -lt $StartTime -or $evt.TimeCreated -gt $EndTime) {
-                        continue
+            foreach ($evt in $events) {
+                $provName = $evt.ProviderName
+                $evtId    = $evt.Id
+
+                # ---- Kernel-Process ImageLoad / ProcessStart: build PID -> ProcessName ----
+                # Event ID 5 is Image Load (DLL/exe mapped into a process) — it carries
+                # ProcessID + ImageFileName, the most reliable source of "PID -> name"
+                # for processes that started BEFORE the trace session began.
+                if ($provName -match 'Kernel-Process|KernelProcess') {
+                    if ($evtId -eq 5 -or $evtId -eq 1) {
+                        try {
+                            $xml = [xml]$evt.ToXml()
+                            $data = @{}
+                            $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
+
+                            $procId = 0
+                            foreach ($k in @('ProcessID','ProcessId','PID')) {
+                                if ($data[$k]) { try { $procId = [int]$data[$k]; break } catch { } }
+                            }
+                            if ($procId -eq 0 -and $evt.ProcessId) { $procId = [int]$evt.ProcessId }
+
+                            $imgPath = $null
+                            foreach ($k in @('ImageFileName','ImageName','FileName','ImagePath','Image','ImageBase')) {
+                                if ($data[$k]) { $imgPath = $data[$k]; break }
+                            }
+
+                            # Event 5 (ImageLoad) fires for every DLL mapped into the
+                            # process — only the .exe image identifies the process itself
+                            # (verified: without this filter PIDs get labelled with DLL names)
+                            if ($procId -gt 0 -and $imgPath -and $imgPath -match '\.exe$' -and -not $pidNameMap.ContainsKey($procId)) {
+                                $pidNameMap[$procId] = (Split-Path -Leaf $imgPath)
+                            }
+                        } catch { }
                     }
-                    try {
-                        $xml = [xml]$evt.ToXml()
-                        $data = @{}
-                        $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
+                    continue
+                }
 
-                        $size = [long]0
-                        foreach ($k in @('size','Size','bytes','Bytes','sizebytes','ByteCount')) {
-                            if ($data[$k]) { try { $size = [long]$data[$k]; break } catch { } }
+                # ---- Kernel-Network Send / Recv: the bytes we want ----
+                if ($provName -match 'Kernel-Network|KernelNetwork') {
+                    $isSend = $sendIds -contains $evtId
+                    if ($isSend -or ($recvIds -contains $evtId)) {
+                        # Filter to the requested time range first (cheap)
+                        if ($evt.TimeCreated -lt $StartTime -or $evt.TimeCreated -gt $EndTime) {
+                            continue
                         }
+                        try {
+                            $xml = [xml]$evt.ToXml()
+                            $data = @{}
+                            $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
 
-                        $procId = 0
-                        foreach ($k in @('PID','ProcessID','ProcessId')) {
-                            if ($data[$k]) { try { $procId = [int]$data[$k]; break } catch { } }
-                        }
-                        if ($procId -eq 0 -and $evt.ProcessId) { $procId = [int]$evt.ProcessId }
+                            $size = [long]0
+                            foreach ($k in @('size','Size','bytes','Bytes','sizebytes','ByteCount')) {
+                                if ($data[$k]) { try { $size = [long]$data[$k]; break } catch { } }
+                            }
 
-                        $trafficEvents += [PSCustomObject]@{
-                            Time        = $evt.TimeCreated
-                            PID         = $procId
-                            ProcessName = ""
-                            Direction   = if ($evtId -eq 3) { "Sent" } else { "Recv" }
-                            Bytes       = $size
-                        }
-                    } catch { }
+                            # Owning PID lives in the PAYLOAD. The event header PID is
+                            # the kernel's (always 4 = System) — never fall back to it.
+                            $procId = 0
+                            foreach ($k in @('PID','ProcessID','ProcessId')) {
+                                if ($data[$k]) { try { $procId = [int]$data[$k]; break } catch { } }
+                            }
+
+                            $trafficEvents.Add([PSCustomObject]@{
+                                Time        = $evt.TimeCreated
+                                PID         = $procId
+                                ProcessName = ""
+                                Direction   = if ($isSend) { "Sent" } else { "Recv" }
+                                Bytes       = $size
+                            })
+                        } catch { }
+                    }
                 }
             }
         }
@@ -1348,19 +1430,16 @@ function Get-TrafficBytes {
             }
         }
 
-        # Cleanup: delete the archived ETL after successful parse to bound disk usage
+        # Cleanup: delete the archived ETLs after successful parse to bound disk usage
         # (the live ETL is the source of truth for the next interval)
-        try {
-            Remove-Item -Path $archiveEtl -Force -ErrorAction SilentlyContinue
-        } catch { }
+        foreach ($archiveEtl in $archiveEtls) {
+            try {
+                Remove-Item -Path $archiveEtl -Force -ErrorAction SilentlyContinue
+            } catch { }
+        }
 
         return $trafficEvents
     } catch [System.Exception] {
-        # Get-WinEvent throws "No events were found..." on empty ETLs — treat as empty
-        if ($_.Exception.Message -match 'No events were found|没有事件') {
-            Write-RunLog "  Archived ETL was empty — no traffic to report."
-            return @()
-        }
         Write-RunLog "Failed to collect traffic data: $_" -Level "WARN"
         return @()
     }
@@ -1828,6 +1907,15 @@ function Write-Report {
             ) -Widths @(6, 28, 14, 14, 14, 8)))
         }
         [void]$sb.AppendLine("")
+    } else {
+        # Make the absence of traffic data visible instead of silently omitting
+        # the section — an empty table here almost always means the ETW session
+        # was not running during the collection window.
+        [void]$sb.AppendLine("【流量 TOP 10 进程 Top 10 Processes by Traffic (Bytes)】")
+        [void]$sb.AppendLine("  本时段无 ETW 流量数据 No ETW traffic data in this window.")
+        [void]$sb.AppendLine("  请确认 Check: 1) ETW 会话是否运行 Traffic session running (-Mode Status);")
+        [void]$sb.AppendLine("              2) 采集时段是否晚于会话启动时间 window starts after session start.")
+        [void]$sb.AppendLine("")
     }
 
     # TOP 10 Processes by connection count (renamed from "流量 TOP 10" — it was misleading:
@@ -2157,10 +2245,12 @@ function Show-Status {
     try {
         if (Test-TrafficSessionExists) {
             if (Test-TrafficSessionRunning) {
-                $etlPath = Join-Path $TrafficEtlDir "traffic.etl"
+                # Live ETLs carry a logman version suffix (traffic_000001.etl) — sum them all
+                $liveEtls = @(Get-ChildItem -Path (Join-Path $TrafficEtlDir "traffic*.etl") -ErrorAction SilentlyContinue |
+                              Where-Object { $_.Name -notmatch '^traffic-' })
                 $sizeStr = "N/A"
-                if (Test-Path $etlPath) {
-                    $sz = (Get-Item $etlPath -ErrorAction SilentlyContinue).Length
+                if ($liveEtls.Count -gt 0) {
+                    $sz = ($liveEtls | Measure-Object -Property Length -Sum).Sum
                     if ($sz) { $sizeStr = Format-BytesForReport -Bytes $sz }
                 }
                 Write-Host "  ETW会话状态 Traffic Session : 运行中 Running (ETL: $sizeStr / max ${TrafficEtlMaxMB}MB circular)" -ForegroundColor Green
