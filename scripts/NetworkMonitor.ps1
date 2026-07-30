@@ -194,6 +194,39 @@ function Format-BytesForReport {
     return "$Bytes B"
 }
 
+function Convert-EtwAddr {
+    # Kernel-Network payload addresses are raw network-byte-order values.
+    # IPv4 events (10/11/42/43): uint32 whose little-endian bytes ARE the dotted
+    # octets (verified: 8.212.20.107 etc. match Sysmon 3 destinations).
+    # IPv6 events (26/27/58/59): ToXml renders the 16-byte address as hex.
+    param([string]$Raw)
+    if (-not $Raw) { return "" }
+    $u = [uint32]0
+    if ([uint32]::TryParse($Raw, [ref]$u)) {
+        $b = [BitConverter]::GetBytes($u)
+        return "$($b[0]).$($b[1]).$($b[2]).$($b[3])"
+    }
+    try {
+        $hex = $Raw -replace '^0x', ''
+        if ($hex -match '^[0-9A-Fa-f]{32}$') {
+            $bytes = [byte[]]::new(16)
+            for ($i = 0; $i -lt 16; $i++) { $bytes[$i] = [Convert]::ToByte($hex.Substring($i * 2, 2), 16) }
+            return ([System.Net.IPAddress]::new($bytes)).ToString()
+        }
+    } catch { }
+    return $Raw
+}
+
+function Convert-EtwPort {
+    # ntohs: payload ports are network byte order (verified: 47873 -> 443, 13568 -> 53)
+    param([string]$Raw)
+    $p = 0
+    if ([int]::TryParse($Raw, [ref]$p)) {
+        return ((($p -band 0xFF) -shl 8) -bor (($p -shr 8) -band 0xFF))
+    }
+    return 0
+}
+
 function Get-DateRange {
     param([int]$HoursBack = 24)
     $endTime   = [DateTime]::Now
@@ -1232,32 +1265,51 @@ function Get-TrafficBytes {
     param([DateTime]$StartTime, [DateTime]$EndTime)
     <#
         .SYNOPSIS
-        Archives the live ETW traffic ETL, restarts the session, then parses the
-        archived ETL to extract per-event Send/Recv bytes with owning PID.
+        Archives the live ETW traffic ETL, restarts the session, then parses each
+        archived ETL with incremental on-disk persistence and crash-safe resume.
         .DESCRIPTION
         Workflow:
-          1. If the trace session is running: stop it, move ALL live traffic*.etl
-             files to timestamped archives (logman appends version suffixes like
-             traffic_000001.etl — never assume a fixed name), restart the session.
-             Also picks up orphaned traffic-*.etl archives from previous runs.
-          2. Parse the archived ETL(s) with Get-WinEvent to extract:
-             - Microsoft-Windows-Kernel-Network TCP/UDP Send (10/26/42/58) and
-               Recv (11/27/43/59) events → bytes + PID (from event PAYLOAD;
-               the event header PID is the kernel's, always 4/System)
-             - Microsoft-Windows-Kernel-Process Event 5/1 (ImageLoad/ProcessStart) → PID -> ImagePath
-          3. Returns one PSCustomObject per Send/Recv event, filtered to [StartTime, EndTime].
+          1. Stop the trace session, move ALL live traffic*.etl files to timestamped
+             archives (logman appends version suffixes like traffic_000001.etl — never
+             assume a fixed name), restart the session. Also pick up orphaned
+             traffic-*.etl archives left behind by a previous crashed run.
+          2. RESUME: if a checkpoint from a previous (crashed) run for the SAME time
+             range exists, reload already-persisted events from the JSONL cache and
+             skip ETLs that were fully parsed & deleted last time. ETLs that were
+             only partially parsed (file still on disk) are re-parsed after dropping
+             their stale cached rows — no duplicate events.
+          3. PARSE each remaining ETL:
+             - Use Get-WinEvent -FilterHashtable @{ Id = send+recv+ProcessStart } so the
+               engine only returns the event IDs we care about. This skips the extremely
+               high-volume ImageLoad (Id=5) events that made the old full-scan path take
+               ~12 min/ETL. Falls back to a full read if FilterHashtable is unsupported.
+             - Extract Kernel-Network Send/Recv (10/26/42/58 / 11/27/43/59) bytes+PID
+               (from event PAYLOAD; header PID is always 4/System) and Kernel-Process
+               ProcessStart (Id=1) → PID->ImagePath.
+             - After each ETL is fully parsed, append its events to a JSONL cache,
+               DELETE the ETL, and update the checkpoint. A crash here loses at most the
+               ETL currently being parsed — everything already written is recoverable.
+          4. Attach process names (PID map hits first, Get-Process fallback for the rest).
+          5. On success, delete the cache & checkpoint (they only exist for crash safety).
         .OUTPUTS
-        [PSCustomObject[]] with Time/PID/ProcessName/Direction/Bytes
+        [PSCustomObject[]] with Time/PID/ProcessName/Direction/Bytes/DestIP/DestPort
     #>
+    # Cache & checkpoint paths are keyed by the requested time range so that re-running
+    # the same day (e.g. after a crash) resumes instead of restarting from scratch.
+    $rangeKey       = "$($StartTime.ToString('yyyyMMddHHmmss'))-$($EndTime.ToString('yyyyMMddHHmmss'))"
+    $cacheFile      = Join-Path $TrafficEtlDir "traffic-cache-$rangeKey.jsonl"
+    $checkpointFile = Join-Path $TrafficEtlDir "traffic-checkpoint-$rangeKey.json"
+
+    $cacheStream = $null
     try {
         Write-RunLog "Collecting ETW traffic data (Kernel-Network Send/Recv)..."
 
         # Live ETL discovery: logman appends a version suffix by default, so the
         # live file is traffic_000001.etl (NOT traffic.etl). Glob traffic*.etl and
-        # exclude our own timestamped archives (traffic-<stamp>-<n>.etl).
+        # exclude our own timestamped archives (traffic-<stamp>-<n>.etl) and caches.
         $getLiveEtls = {
             @(Get-ChildItem -Path (Join-Path $TrafficEtlDir "traffic*.etl") -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -notmatch '^traffic-' })
+              Where-Object { $_.Name -notmatch '^traffic-' -and $_.Name -notmatch '^traffic-cache-' -and $_.Name -notmatch '^traffic-checkpoint-' })
         }
 
         # ---- Step 1: archive the live ETL(s) and restart the session ----
@@ -1305,143 +1357,292 @@ function Get-TrafficBytes {
         }
 
         # Pick up orphaned archives (e.g. files archived by Init to unblock
-        # logman start, or left behind if a previous Export crashed mid-parse)
+        # logman start, or left behind if a previous Export crashed mid-parse).
+        # Exclude our cache/checkpoint files which also match traffic-*.etl glob.
         $orphans = @(Get-ChildItem -Path (Join-Path $TrafficEtlDir "traffic-*.etl") -ErrorAction SilentlyContinue |
-                     Where-Object { $archiveEtls -notcontains $_.FullName })
+                     Where-Object { $archiveEtls -notcontains $_.FullName -and $_.Name -notmatch '^traffic-cache-' -and $_.Name -notmatch '^traffic-checkpoint-' })
         foreach ($o in $orphans) {
             Write-RunLog "  Picking up orphaned archive: $($o.Name)"
             $archiveEtls += $o.FullName
         }
 
-        if ($archiveEtls.Count -eq 0) {
+        # ---- Step 2: resume from a previous crashed run (same time range) ----
+        $pidNameMap = @{}        # PID -> process name (accumulated across ETLs)
+        $trafficEvents = [System.Collections.Generic.List[object]]::new()
+        $doneEtls = @{}          # etl-name -> $true : fully parsed & persisted last run
+        $resumeMode = $false
+
+        if (Test-Path $checkpointFile) {
+            try {
+                $ckpt = Get-Content $checkpointFile -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($ckpt.status -eq 'incomplete' -and $ckpt.rangeKey -eq $rangeKey) {
+                    $resumeMode = $true
+                    if (Test-Path $cacheFile) {
+                        $cachedLines = Get-Content $cacheFile -Encoding UTF8 -ErrorAction SilentlyContinue
+                        foreach ($line in $cachedLines) {
+                            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                            try { $o = $line | ConvertFrom-Json } catch { continue }
+                            $pn = if ($o.pn) { [string]$o.pn } else { "" }
+                            $pidVal = [int]$o.pid
+                            $trafficEvents.Add([PSCustomObject]@{
+                                Time        = [DateTime]::Parse($o.t, $null, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+                                PID         = $pidVal
+                                ProcessName = $pn
+                                Direction   = [string]$o.dir
+                                Bytes       = [long]$o.b
+                                DestIP      = [string]$o.dip
+                                DestPort    = [int]$o.dp
+                            })
+                            if ($pn -and -not $pidNameMap.ContainsKey($pidVal)) { $pidNameMap[$pidVal] = $pn }
+                            if ($o.etl -and -not $doneEtls.ContainsKey([string]$o.etl)) { $doneEtls[[string]$o.etl] = $true }
+                        }
+                        Write-RunLog "  Resumed from cache: $($trafficEvents.Count) events, $($doneEtls.Count) ETL(s) already done."
+                    }
+                }
+            } catch {
+                Write-RunLog "  Checkpoint read failed, starting fresh: $_" -Level "WARN"
+                $resumeMode = $false
+                $doneEtls = @{}
+                $trafficEvents.Clear()
+                $pidNameMap = @{}
+            }
+        }
+
+        # Classify archived ETLs: skip done-and-deleted; re-parse stale (cached but
+        # file still present); parse fresh ones normally.
+        $staleEtls = [System.Collections.Generic.List[string]]::new()
+        $toParse   = [System.Collections.Generic.List[string]]::new()
+        foreach ($etl in $archiveEtls) {
+            $name = Split-Path $etl -Leaf
+            if ($doneEtls.ContainsKey($name)) {
+                if (Test-Path $etl) {
+                    # Was persisted to cache but the file wasn't deleted (crash after
+                    # write, before delete) — drop its stale rows then re-parse.
+                    $staleEtls.Add($name)
+                    $toParse.Add($etl)
+                }
+                # else: done & already deleted -> nothing to do
+            } else {
+                $toParse.Add($etl)
+            }
+        }
+
+        # Drop stale cached rows so re-parsing won't duplicate events.
+        if ($staleEtls.Count -gt 0 -and (Test-Path $cacheFile)) {
+            try {
+                $kept = [System.Collections.Generic.List[string]]::new()
+                foreach ($line in (Get-Content $cacheFile -Encoding UTF8)) {
+                    $drop = $false
+                    foreach ($s in $staleEtls) {
+                        if ($line -match ([regex]::Escape("`"etl`":`"$s`""))) { $drop = $true; break }
+                    }
+                    if (-not $drop) { $kept.Add($line) }
+                }
+                $kept | Out-File -FilePath $cacheFile -Encoding UTF8 -Force
+                Write-RunLog "  Dropped $($staleEtls.Count) stale ETL row(s) from cache for re-parse."
+            } catch {
+                Write-RunLog "  Stale cache rewrite failed (will proceed): $_" -Level "WARN"
+            }
+        }
+
+        # Fresh run: discard any leftover cache/checkpoint from a different range.
+        if (-not $resumeMode) {
+            if (Test-Path $cacheFile)      { Remove-Item $cacheFile -Force -ErrorAction SilentlyContinue }
+            if (Test-Path $checkpointFile) { Remove-Item $checkpointFile -Force -ErrorAction SilentlyContinue }
+        }
+
+        # Initialize checkpoint for this run.
+        $ckptDone = [System.Collections.Generic.List[string]]::new()
+        foreach ($k in $doneEtls.Keys) { $ckptDone.Add($k) }
+        @{ status = 'incomplete'; rangeKey = $rangeKey; doneEtls = $ckptDone.ToArray() } |
+            ConvertTo-Json -Depth 5 | Out-File -FilePath $checkpointFile -Encoding UTF8 -Force
+
+        if ($toParse.Count -eq 0 -and $trafficEvents.Count -eq 0) {
             Write-RunLog "  No ETL data to parse. Run -Mode Init first if the session is missing." -Level "WARN"
+            Remove-Item $cacheFile -Force -ErrorAction SilentlyContinue
+            Remove-Item $checkpointFile -Force -ErrorAction SilentlyContinue
             return @()
         }
 
-        # ---- Step 2: parse the archived ETL(s) ----
+        # Open cache for append (UTF-8, no BOM; auto-flush so a crash keeps what's written).
+        $cacheStream = [System.IO.StreamWriter]::new($cacheFile, $true, [System.Text.UTF8Encoding]::new($false))
+        $cacheStream.AutoFlush = $true
+
+        # ---- Step 3: parse each remaining ETL ----
         # Kernel-Network manifest event IDs (verified against a live capture —
         # this provider does NOT use 3/4 for send/recv):
         #   TCPv4 send/recv = 10/11    TCPv6 send/recv = 26/27
         #   UDPv4 send/recv = 42/43    UDPv6 send/recv = 58/59
         # 18 (TCP copy) is deliberately excluded — it would double-count bytes.
+        # Id=1 = Kernel-Process ProcessStart (PID+ImagePath), used to build the name map
+        # WITHOUT pulling the enormous ImageLoad(Id=5) stream.
         $sendIds = @(10, 26, 42, 58)
         $recvIds = @(11, 27, 43, 59)
+        $filterIds = $sendIds + $recvIds + @(1)
+        # FilterXPath is the engine-side filter compatible with -Path (unlike
+        # -FilterHashtable, which CANNOT be combined with -Path — they belong to
+        # different parameter sets). Skipping the huge ImageLoad(Id=5) stream is
+        # what makes the parse far faster than the old full scan.
+        $xpathFilter = "*[System[(" + (($filterIds | ForEach-Object { "EventID=$_" }) -join " or ") + ")]]"
 
-        $pidNameMap = @{}        # PID -> process name (from Kernel-Process ImageLoad)
-        $trafficEvents = [System.Collections.Generic.List[object]]::new()
-
-        foreach ($archiveEtl in $archiveEtls) {
+        foreach ($archiveEtl in $toParse) {
+            $etlName = Split-Path $archiveEtl -Leaf
             Write-RunLog "  Parsing ETL: $archiveEtl"
             $events = $null
             try {
-                # Cap to 1M events per file to bound memory
-                $events = Get-WinEvent -Path $archiveEtl -Oldest -MaxEvents 1000000 -ErrorAction Stop
+                # Engine-side XPath Id filter. Caps to 1M matched events per file.
+                $events = Get-WinEvent -Path $archiveEtl -Oldest -MaxEvents 1000000 -FilterXPath $xpathFilter -ErrorAction Stop
             } catch {
-                if ($_.Exception.Message -match 'No events were found|没有事件') {
-                    Write-RunLog "  ETL was empty: $archiveEtl"
+                if ($_.Exception.Message -match 'No events were found|没有事件|NoMatchingEventsFound') {
+                    Write-RunLog "  ETL had no matching events: $archiveEtl"
                 } else {
-                    Write-RunLog "  Failed to parse ETL ${archiveEtl}: $_" -Level "WARN"
-                }
-                continue
-            }
-
-            foreach ($evt in $events) {
-                $provName = $evt.ProviderName
-                $evtId    = $evt.Id
-
-                # ---- Kernel-Process ImageLoad / ProcessStart: build PID -> ProcessName ----
-                # Event ID 5 is Image Load (DLL/exe mapped into a process) — it carries
-                # ProcessID + ImageFileName, the most reliable source of "PID -> name"
-                # for processes that started BEFORE the trace session began.
-                if ($provName -match 'Kernel-Process|KernelProcess') {
-                    if ($evtId -eq 5 -or $evtId -eq 1) {
-                        try {
-                            $xml = [xml]$evt.ToXml()
-                            $data = @{}
-                            $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
-
-                            $procId = 0
-                            foreach ($k in @('ProcessID','ProcessId','PID')) {
-                                if ($data[$k]) { try { $procId = [int]$data[$k]; break } catch { } }
-                            }
-                            if ($procId -eq 0 -and $evt.ProcessId) { $procId = [int]$evt.ProcessId }
-
-                            $imgPath = $null
-                            foreach ($k in @('ImageFileName','ImageName','FileName','ImagePath','Image','ImageBase')) {
-                                if ($data[$k]) { $imgPath = $data[$k]; break }
-                            }
-
-                            # Event 5 (ImageLoad) fires for every DLL mapped into the
-                            # process — only the .exe image identifies the process itself
-                            # (verified: without this filter PIDs get labelled with DLL names)
-                            if ($procId -gt 0 -and $imgPath -and $imgPath -match '\.exe$' -and -not $pidNameMap.ContainsKey($procId)) {
-                                $pidNameMap[$procId] = (Split-Path -Leaf $imgPath)
-                            }
-                        } catch { }
-                    }
-                    continue
-                }
-
-                # ---- Kernel-Network Send / Recv: the bytes we want ----
-                if ($provName -match 'Kernel-Network|KernelNetwork') {
-                    $isSend = $sendIds -contains $evtId
-                    if ($isSend -or ($recvIds -contains $evtId)) {
-                        # Filter to the requested time range first (cheap)
-                        if ($evt.TimeCreated -lt $StartTime -or $evt.TimeCreated -gt $EndTime) {
-                            continue
+                    # Some ETL/Windows combinations reject FilterXPath — fall back
+                    # to a full read (the original behaviour).
+                    Write-RunLog "  FilterXPath unsupported, falling back to full read: $_" -Level "WARN"
+                    try { $events = Get-WinEvent -Path $archiveEtl -Oldest -MaxEvents 1000000 -ErrorAction Stop }
+                    catch {
+                        if ($_.Exception.Message -match 'No events were found|没有事件') {
+                            Write-RunLog "  ETL was empty: $archiveEtl"
+                        } else {
+                            Write-RunLog "  Failed to parse ETL ${archiveEtl}: $_" -Level "WARN"
                         }
-                        try {
-                            $xml = [xml]$evt.ToXml()
-                            $data = @{}
-                            $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
-
-                            $size = [long]0
-                            foreach ($k in @('size','Size','bytes','Bytes','sizebytes','ByteCount')) {
-                                if ($data[$k]) { try { $size = [long]$data[$k]; break } catch { } }
-                            }
-
-                            # Owning PID lives in the PAYLOAD. The event header PID is
-                            # the kernel's (always 4 = System) — never fall back to it.
-                            $procId = 0
-                            foreach ($k in @('PID','ProcessID','ProcessId')) {
-                                if ($data[$k]) { try { $procId = [int]$data[$k]; break } catch { } }
-                            }
-
-                            $trafficEvents.Add([PSCustomObject]@{
-                                Time        = $evt.TimeCreated
-                                PID         = $procId
-                                ProcessName = ""
-                                Direction   = if ($isSend) { "Sent" } else { "Recv" }
-                                Bytes       = $size
-                            })
-                        } catch { }
+                        # Even an empty/failed ETL is "done": delete it + checkpoint so we don't loop forever.
+                        try { Remove-Item -Path $archiveEtl -Force -ErrorAction SilentlyContinue } catch { }
+                        if (-not $ckptDone.Contains($etlName)) { $ckptDone.Add($etlName) }
+                        @{ status='incomplete'; rangeKey=$rangeKey; doneEtls=$ckptDone.ToArray() } |
+                            ConvertTo-Json -Depth 5 | Out-File -FilePath $checkpointFile -Encoding UTF8 -Force
+                        continue
                     }
                 }
             }
+
+            $beforeCount = $trafficEvents.Count
+
+            if ($events) {
+                foreach ($evt in $events) {
+                    $provName = $evt.ProviderName
+                    $evtId    = $evt.Id
+
+                    # ---- Kernel-Process ProcessStart / ImageLoad: build PID -> ProcessName ----
+                    # Id=1 (ProcessStart) is the primary source under the FilterHashtable path.
+                    # Id=5 (ImageLoad) is only seen on the full-read fallback; kept for compatibility.
+                    if ($provName -match 'Kernel-Process|KernelProcess') {
+                        if ($evtId -eq 1 -or $evtId -eq 5) {
+                            try {
+                                $xml = [xml]$evt.ToXml()
+                                $data = @{}
+                                $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
+
+                                $procId = 0
+                                foreach ($k in @('ProcessID','ProcessId','PID')) {
+                                    if ($data[$k]) { try { $procId = [int]$data[$k]; break } catch { } }
+                                }
+                                if ($procId -eq 0 -and $evt.ProcessId) { $procId = [int]$evt.ProcessId }
+
+                                $imgPath = $null
+                                foreach ($k in @('ImageFileName','ImageName','FileName','ImagePath','Image','ImageBase')) {
+                                    if ($data[$k]) { $imgPath = $data[$k]; break }
+                                }
+
+                                # Event 5 fires for every DLL mapped into the process — only
+                                # the .exe image identifies the process itself.
+                                if ($procId -gt 0 -and $imgPath -and $imgPath -match '\.exe$' -and -not $pidNameMap.ContainsKey($procId)) {
+                                    $pidNameMap[$procId] = (Split-Path -Leaf $imgPath)
+                                }
+                            } catch { }
+                        }
+                        continue
+                    }
+
+                    # ---- Kernel-Network Send / Recv: the bytes we want ----
+                    if ($provName -match 'Kernel-Network|KernelNetwork') {
+                        $isSend = $sendIds -contains $evtId
+                        if ($isSend -or ($recvIds -contains $evtId)) {
+                            # Filter to the requested time range first (cheap)
+                            if ($evt.TimeCreated -lt $StartTime -or $evt.TimeCreated -gt $EndTime) {
+                                continue
+                            }
+                            try {
+                                $xml = [xml]$evt.ToXml()
+                                $data = @{}
+                                $xml.Event.EventData.Data | ForEach-Object { $data[$_.Name] = $_.'#text' }
+
+                                $size = [long]0
+                                foreach ($k in @('size','Size','bytes','Bytes','sizebytes','ByteCount')) {
+                                    if ($data[$k]) { try { $size = [long]$data[$k]; break } catch { } }
+                                }
+
+                                # Owning PID lives in the PAYLOAD. The event header PID is
+                                # the kernel's (always 4 = System) — never fall back to it.
+                                $procId = 0
+                                foreach ($k in @('PID','ProcessID','ProcessId')) {
+                                    if ($data[$k]) { try { $procId = [int]$data[$k]; break } catch { } }
+                                }
+
+                                # Remote endpoint: daddr:dport is the REMOTE peer for BOTH
+                                # send and recv events. Values are network byte order.
+                                $destIP   = Convert-EtwAddr -Raw $data['daddr']
+                                $destPort = Convert-EtwPort -Raw $data['dport']
+
+                                $pn = if ($pidNameMap.ContainsKey($procId)) { $pidNameMap[$procId] } else { "" }
+                                $dir = if ($isSend) { "Sent" } else { "Recv" }
+
+                                $trafficEvents.Add([PSCustomObject]@{
+                                    Time        = $evt.TimeCreated
+                                    PID         = $procId
+                                    ProcessName = $pn
+                                    Direction   = $dir
+                                    Bytes       = $size
+                                    DestIP      = $destIP
+                                    DestPort    = $destPort
+                                })
+
+                                # Incremental persist: one compact JSON line per event.
+                                $pnEsc = $pn.Replace('\','\\').Replace('"','\"')
+                                $cacheStream.WriteLine('{"t":"' + $evt.TimeCreated.ToString('o') + '","pid":' + $procId + ',"pn":' + $(if ($pnEsc) { '"' + $pnEsc + '"' } else { 'null' }) + ',"dir":"' + $dir + '","b":' + $size + ',"dip":"' + $destIP + '","dp":' + $destPort + ',"etl":"' + $etlName + '"}')
+                            } catch { }
+                        }
+                    }
+                }
+            }
+
+            $added = $trafficEvents.Count - $beforeCount
+            Write-RunLog "  ETL parsed: $etlName (+$added events, total $($trafficEvents.Count))."
+
+            # ETL fully parsed & persisted -> delete it (bounded disk) and checkpoint it.
+            try { Remove-Item -Path $archiveEtl -Force -ErrorAction SilentlyContinue } catch { }
+            if (-not $ckptDone.Contains($etlName)) { $ckptDone.Add($etlName) }
+            @{ status='incomplete'; rangeKey=$rangeKey; doneEtls=$ckptDone.ToArray() } |
+                ConvertTo-Json -Depth 5 | Out-File -FilePath $checkpointFile -Encoding UTF8 -Force
         }
+
+        $cacheStream.Close()
+        $cacheStream = $null
+
         Write-RunLog "  Parsed $($trafficEvents.Count) Send/Recv events (PID map size: $($pidNameMap.Count))."
 
-        # ---- Step 3: attach process names ----
+        # ---- Step 4: attach process names for any still empty ----
         foreach ($evt in $trafficEvents) {
-            if ($pidNameMap.ContainsKey($evt.PID)) {
-                $evt.ProcessName = $pidNameMap[$evt.PID]
-            } else {
-                $evt.ProcessName = Get-ProcessNameByPID -ProcId $evt.PID
+            if (-not $evt.ProcessName) {
+                if ($pidNameMap.ContainsKey($evt.PID)) {
+                    $evt.ProcessName = $pidNameMap[$evt.PID]
+                } else {
+                    $evt.ProcessName = Get-ProcessNameByPID -ProcId $evt.PID
+                }
             }
         }
 
-        # Cleanup: delete the archived ETLs after successful parse to bound disk usage
-        # (the live ETL is the source of truth for the next interval)
-        foreach ($archiveEtl in $archiveEtls) {
-            try {
-                Remove-Item -Path $archiveEtl -Force -ErrorAction SilentlyContinue
-            } catch { }
-        }
+        # Success: discard cache & checkpoint (they only exist for crash safety).
+        Remove-Item $cacheFile -Force -ErrorAction SilentlyContinue
+        Remove-Item $checkpointFile -Force -ErrorAction SilentlyContinue
 
         return $trafficEvents
     } catch [System.Exception] {
         Write-RunLog "Failed to collect traffic data: $_" -Level "WARN"
+        # Intentionally keep cache + checkpoint so the next run can resume.
         return @()
+    } finally {
+        if ($cacheStream) { try { $cacheStream.Close() } catch { } }
     }
 }
 
@@ -1540,6 +1741,59 @@ function Get-Top10ProcessByTraffic {
     $results = $results | Sort-Object TotalBytes -Descending | Select-Object -First 10
     for ($i = 0; $i -lt $results.Count; $i++) { $results[$i].Rank = $i + 1 }
     return $results
+}
+
+function Get-ConnectionTrafficDetails {
+    param([object[]]$TrafficEvents)
+    <#
+        .SYNOPSIS
+        Aggregate Send/Recv bytes per (process, remote IP:port) endpoint pair.
+        .DESCRIPTION
+        Finest granularity the Kernel-Network provider allows: its payload has
+        no usable connection ID (connid is always 0 — verified), so two
+        sequential TCP sessions from the same process to the same endpoint
+        cannot be told apart. Endpoint-level aggregation is still "per
+        connection" for all practical bandwidth-attribution purposes.
+        .OUTPUTS
+        [PSCustomObject[]] ProcessName/DestIP/DestPort/SentBytes/RecvBytes/TotalBytes/FirstSeen/LastSeen
+    #>
+    if (-not $TrafficEvents -or $TrafficEvents.Count -eq 0) { return @() }
+
+    $agg = @{}
+    foreach ($e in $TrafficEvents) {
+        if (-not $e.DestIP) { continue }
+        $name = if ($e.ProcessName) { $e.ProcessName } else { "PID:$($e.PID)" }
+        $key = "$name|$($e.DestIP)|$($e.DestPort)"
+        if (-not $agg.ContainsKey($key)) {
+            $agg[$key] = @{
+                ProcessName = $name
+                DestIP      = $e.DestIP
+                DestPort    = $e.DestPort
+                Sent        = [long]0
+                Recv        = [long]0
+                First       = $e.Time
+                Last        = $e.Time
+            }
+        }
+        $a = $agg[$key]
+        if ($e.Direction -eq "Sent") { $a.Sent += [long]$e.Bytes } else { $a.Recv += [long]$e.Bytes }
+        if ($e.Time -lt $a.First) { $a.First = $e.Time }
+        if ($e.Time -gt $a.Last)  { $a.Last  = $e.Time }
+    }
+
+    $results = foreach ($a in $agg.Values) {
+        [PSCustomObject]@{
+            ProcessName = $a.ProcessName
+            DestIP      = $a.DestIP
+            DestPort    = $a.DestPort
+            SentBytes   = $a.Sent
+            RecvBytes   = $a.Recv
+            TotalBytes  = $a.Sent + $a.Recv
+            FirstSeen   = $a.First
+            LastSeen    = $a.Last
+        }
+    }
+    return @($results | Sort-Object TotalBytes -Descending)
 }
 
 function Get-Top10Domain {
@@ -1843,6 +2097,7 @@ function Write-Report {
     $connStats = Get-ConnectionStats -Security5156 $Security5156 -Sysmon3 $Sysmon3
     $top10Proc = Get-Top10ProcessByConnection -Security5156 $Security5156 -Sysmon3 $Sysmon3
     $top10Traffic = Get-Top10ProcessByTraffic -TrafficEvents $TrafficEvents
+    $connTraffic = Get-ConnectionTrafficDetails -TrafficEvents $TrafficEvents
     $top10Domain = Get-Top10Domain -DNS3008 $DNS3008
     $top10File = Get-Top10FileCreate -Sysmon11 $Sysmon11
 
@@ -2035,6 +2290,36 @@ function Write-Report {
     [void]$sb.AppendLine("  第二部分 Part 2：详细连接记录 Connection Details")
     [void]$sb.AppendLine("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     [void]$sb.AppendLine("")
+
+    # Per-connection byte counts from ETW (process × remote endpoint).
+    # NOTE: the Kernel-Network payload has no usable connection ID (connid=0),
+    # so repeated sessions to the same endpoint are merged — this is the finest
+    # granularity the data source physically provides.
+    if ($connTraffic.Count -gt 0) {
+        [void]$sb.AppendLine("【连接流量明细 Per-Connection Traffic】（进程×远端端点聚合，按总字节数降序 by process×remote endpoint, sorted by bytes）")
+        [void]$sb.AppendLine((Format-FixedWidth -Columns @("进程 Process", "目标 Dest IP:Port", "上传 Sent", "下载 Recv", "总计 Total", "首次 First", "末次 Last") -Widths @(28, 28, 12, 12, 12, 10, 10)))
+        [void]$sb.AppendLine((Format-FixedWidth -Columns @("------------", "----------------", "---------", "---------", "---------", "--------", "--------") -Widths @(28, 28, 12, 12, 12, 10, 10)))
+        # Cap at 200 rows — beyond that the long tail is noise (single-digit KB)
+        foreach ($ct in ($connTraffic | Select-Object -First 200)) {
+            [void]$sb.AppendLine((Format-FixedWidth -Columns @(
+                $ct.ProcessName,
+                "$($ct.DestIP):$($ct.DestPort)",
+                (Format-BytesForReport -Bytes $ct.SentBytes),
+                (Format-BytesForReport -Bytes $ct.RecvBytes),
+                (Format-BytesForReport -Bytes $ct.TotalBytes),
+                $ct.FirstSeen.ToString('HH:mm:ss'),
+                $ct.LastSeen.ToString('HH:mm:ss')
+            ) -Widths @(28, 28, 12, 12, 12, 10, 10)))
+        }
+        $shown = [math]::Min(200, $connTraffic.Count)
+        [void]$sb.AppendLine("...（显示 $shown / 共 $($connTraffic.Count) 个端点 endpoints shown）")
+        [void]$sb.AppendLine("")
+    } else {
+        [void]$sb.AppendLine("【连接流量明细 Per-Connection Traffic】")
+        [void]$sb.AppendLine("  本时段无 ETW 流量数据 No ETW traffic data in this window.")
+        [void]$sb.AppendLine("")
+    }
+
     [void]$sb.AppendLine("【网络连接明细 Network Connection Details】（按时间排序 by time）")
     [void]$sb.AppendLine((Format-FixedWidth -Columns @("时间 Time", "进程 Process", "方向 Dir", "目标IP Dest IP", "端口 Port", "协议 Proto") -Widths @(22, 30, 6, 18, 8, 6)))
     [void]$sb.AppendLine((Format-FixedWidth -Columns @("----------", "-------------", "------", "--------------", "--------", "---------") -Widths @(22, 30, 6, 18, 8, 6)))
